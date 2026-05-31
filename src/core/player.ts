@@ -1,0 +1,835 @@
+// src/core/player.ts
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { KINDS, GENDERS, FORMS, RACES, getMixedRaceBonus } from '../utils/race';
+import { pluginState } from './state';
+
+const BASE_STAT = 3;
+
+// ==================== 体型计算常量 ====================
+const RACE_SIZE_BONUSES = [
+    { kindId: 2, formId: 3, extraBonus: 1 },
+    { kindId: 0, formId: 3, extraBonus: 3 },
+    { kindId: 1, formId: 3, extraBonus: 2 }
+];
+
+// ==================== 基础属性结构（固定） ====================
+export interface BaseStats {
+    midStr: number;
+    midDex: number;
+    midCon: number;
+    midInt: number;
+    midCha: number;
+    midLuc: number;
+    str: number;
+    dex: number;
+    con: number;
+    int: number;
+    cha: number;
+    luc: number;
+    strMulti: number;
+    dexMulti: number;
+    conMulti: number;
+    intMulti: number;
+    chaMulti: number;
+    lucMulti: number;
+}
+
+// ==================== 扩展属性结构（可动态添加） ====================
+export interface ExtendedStats {
+    // 货币类
+    gold?: number;      // 金币（替代原来的 money）
+    silver?: number;    // 银币（未来扩展）
+    copper?: number;    // 铜币（未来扩展）
+    
+    // 状态类
+    mood?: number;      // 心情
+    health?: number;    // 健康
+    energy?: number;    // 精力（未来扩展）
+    hunger?: number;    // 饱食度（未来扩展）
+    thirst?: number;    // 口渴度（未来扩展）
+    
+    // 成长类
+    freePoints?: number;    // 自由点
+    exp?: number;           // 经验值（未来扩展）
+    level?: number;         // 等级（未来扩展）
+    
+    // 物品相关
+    items?: Array<{ id: number; quantity: number }>;
+    
+    // 限制计数
+    bookUseCount?: {
+        cha?: number;
+        luc?: number;
+        int?: number;
+        con?: number;
+    };
+    
+    // 折扣
+    discountStack?: number;
+    
+    // 历练完成次数
+    advData?: Record<number, number>;
+
+    // 工作完成次数
+    workData?: Record<number, number>;
+
+    // 自然平衡周期编号（固定时间点追踪）
+    lastRegenPeriod?: number;
+
+    // 濒危/ICU 状态
+    criticalICUUntil?: number;      // ICU 到期时间戳（0=不在ICU，>0=ICU中）
+    criticalDebuffUntil?: number;   // 妖精濒危 debuff 到期时间戳
+    criticalDebuffStacks?: number;  // 妖精濒危 debuff 叠加层数
+
+    // 其他任意扩展字段
+    [key: string]: any;
+}
+
+// ==================== 玩家数据结构 ====================
+export interface PlayerData {
+    // 版本号（用于数据迁移）
+    version: number;
+    
+    // 基础信息（固定）
+    userId: number;
+    nickname: string;
+    kindId: number;
+    kindName: string;
+    genderId: number;
+    genderName: string;
+    formId: number;
+    formName: string;
+    races: number[];
+    mixedRaceName?: string;
+    size: number;
+    createdAt: number;
+    lastActive: number;
+    
+    // 基础属性（固定结构）
+    base: BaseStats;
+    
+    // 扩展属性（可动态添加）
+    ext: ExtendedStats;
+}
+
+// ==================== 默认值 ====================
+const DEFAULT_EXTENDED: ExtendedStats = {
+    gold: 200,
+    mood: 80,
+    health: 80,
+    freePoints: 3,
+    items: [],
+    bookUseCount: {},
+    discountStack: 0,
+    advData: {},
+    workData: {},
+    lastRegenPeriod: 0,
+    criticalICUUntil: 0,
+    criticalDebuffUntil: 0,
+    criticalDebuffStacks: 0,
+};
+
+// ==================== 存储 ====================
+let dataDir: string = '';
+let logger: any = null;
+
+export function initPlayerStorage(ctx: any, dataPath: string): void {
+    logger = ctx.logger;
+    dataDir = path.join(dataPath, 'players');
+    if (!fs.existsSync(dataDir)) {
+        fs.mkdirSync(dataDir, { recursive: true });
+    }
+    logger.info('[Player] 玩家存储模块已初始化，数据目录:', dataDir);
+}
+
+function getPlayerFilePath(userId: number): string {
+    return path.join(dataDir, `${userId}.json`);
+}
+
+// 数据迁移函数（处理旧版本数据）
+function migratePlayerData(data: any): PlayerData {
+    const CURRENT_VERSION = 3;
+
+    // v3 格式：有 lastRegenPeriod
+    if (data.version === CURRENT_VERSION && data.base && data.ext) {
+        return data as PlayerData;
+    }
+
+    // v2 格式：有 base/ext 但缺少 lastRegenPeriod
+    if (data.version === 2 && data.base && data.ext) {
+        const player = data as PlayerData;
+        player.version = CURRENT_VERSION;
+        if (player.ext.lastRegenPeriod === undefined) {
+            player.ext.lastRegenPeriod = 0;
+        }
+        if (player.ext.criticalICUUntil === undefined) {
+            player.ext.criticalICUUntil = 0;
+        }
+        if (player.ext.criticalDebuffUntil === undefined) {
+            player.ext.criticalDebuffUntil = 0;
+        }
+        if (player.ext.criticalDebuffStacks === undefined) {
+            player.ext.criticalDebuffStacks = 0;
+        }
+        return player;
+    }
+
+    // 旧版本格式迁移
+    const migrated: PlayerData = {
+        version: CURRENT_VERSION,
+        userId: data.userId,
+        nickname: data.nickname,
+        kindId: data.kindId,
+        kindName: data.kindName,
+        genderId: data.genderId,
+        genderName: data.genderName,
+        formId: data.formId,
+        formName: data.formName,
+        races: data.races,
+        mixedRaceName: data.mixedRaceName,
+        size: data.size,
+        createdAt: data.createdAt,
+        lastActive: data.lastActive,
+        base: {
+            midStr: data.midStr,
+            midDex: data.midDex,
+            midCon: data.midCon,
+            midInt: data.midInt,
+            midCha: data.midCha,
+            midLuc: data.midLuc,
+            str: data.str,
+            dex: data.dex,
+            con: data.con,
+            int: data.int,
+            cha: data.cha,
+            luc: data.luc,
+            strMulti: data.strMulti,
+            dexMulti: data.dexMulti,
+            conMulti: data.conMulti,
+            intMulti: data.intMulti,
+            chaMulti: data.chaMulti,
+            lucMulti: data.lucMulti
+        },
+        ext: {
+            gold: data.money ?? 200,
+            mood: data.mood ?? 80,
+            health: data.health ?? 80,
+            freePoints: data.freePoints ?? 3,
+            items: data.items ?? [],
+            bookUseCount: data.bookUseCount ?? {},
+            discountStack: data.discountStack ?? 0,
+            advData: data.advData ?? {},
+            workData: data.workData ?? {},
+            lastRegenPeriod: data.ext?.lastRegenPeriod ?? 0,
+            criticalICUUntil: data.ext?.criticalICUUntil ?? 0,
+            criticalDebuffUntil: data.ext?.criticalDebuffUntil ?? 0,
+            criticalDebuffStacks: data.ext?.criticalDebuffStacks ?? 0,
+        }
+    };
+    
+    return migrated;
+}
+
+// ==================== 自然平衡 ====================
+
+/** 计算当前固定周期编号（基于全局统一时间线） */
+function getCurrentRegenPeriod(): number {
+    const cfg = pluginState.config;
+    const cycleMs = cfg.moodRegenCycleHours * 60 * 60 * 1000;
+    return Math.floor(Date.now() / cycleMs);
+}
+
+/**
+ * 应用心情和健康的自然平衡
+ * 基于固定周期编号（全局统一时间点），而非相对时间
+ * 健康 < 目标值时缓慢恢复；心情双向回归目标值
+ * 低于 regenMinThreshold 不触发（强制看医生）
+ *
+ * 种族特化：
+ * - 妖精(id=8)：健康恢复 ×3，无视 regenMinThreshold 健康锁
+ * - 机械(id=7)：心情下降速度减半
+ * @returns 是否有数据变更（需要持久化）
+ */
+function applyNaturalRegen(player: PlayerData): boolean {
+    const cfg = pluginState.config;
+    const currentPeriod = getCurrentRegenPeriod();
+    const lastPeriod = player.ext.lastRegenPeriod ?? 0;
+
+    if (currentPeriod <= lastPeriod) return false;
+
+    const cycles = currentPeriod - lastPeriod;
+    const isFairy = player.races.includes(8);
+    const isMachine = player.races.includes(7);
+
+    let changed = false;
+
+    // 心情双向回归目标值
+    const currentMood = player.ext.mood ?? 80;
+    if (currentMood >= cfg.regenMinThreshold && currentMood !== cfg.regenTarget) {
+        let delta = cfg.moodRegenPerCycle * cycles;
+        // 机械：心情下降速度减半（仅当高于目标值时）
+        if (isMachine && currentMood > cfg.regenTarget) {
+            delta = Math.max(1, Math.floor(delta / 2));
+        }
+        if (currentMood < cfg.regenTarget) {
+            player.ext.mood = Math.min(cfg.regenTarget, currentMood + delta);
+        } else {
+            player.ext.mood = Math.max(cfg.regenTarget, currentMood - delta);
+        }
+        changed = true;
+    }
+
+    // 健康仅向上恢复到目标值
+    const currentHealth = player.ext.health ?? 80;
+    // 妖精无视健康锁，其余种族受 regenMinThreshold 限制
+    const healthThreshold = isFairy ? 0 : cfg.regenMinThreshold;
+    if (currentHealth >= healthThreshold && currentHealth < cfg.regenTarget) {
+        let healthDelta = cfg.healthRegenPerCycle * cycles;
+        // 妖精：健康恢复 ×3
+        if (isFairy) {
+            healthDelta *= 3;
+        }
+        player.ext.health = Math.min(cfg.regenTarget, currentHealth + healthDelta);
+        changed = true;
+    }
+
+    // 更新周期编号（无论是否有变化，都推进到当前周期）
+    player.ext.lastRegenPeriod = currentPeriod;
+
+    if (changed) {
+        logger?.debug(`[Player] 用户 ${player.userId} 自然平衡(周期${lastPeriod}→${currentPeriod}): 心情=${player.ext.mood} 健康=${player.ext.health}`);
+    }
+
+    return changed;
+}
+
+// ==================== 濒危机制 ====================
+
+/**
+ * 濒危处理：健康 <= 0 时自动触发
+ * - 普通种族：自动紧急救助，费用和耗时 ×3，期间锁定操作
+ * - 妖精(id=8)：立即复活至 60 健康，全属性 -10% -1 持续24h，可叠加
+ */
+function handleCriticalState(player: PlayerData): void {
+    const now = Date.now();
+
+    if (player.races.includes(8)) {
+        // 妖精复活
+        player.ext.health = 60;
+        const existingUntil = player.ext.criticalDebuffUntil ?? 0;
+        // 重复触发延长持续时间（从当前时间或上次到期时间中较晚者起算）
+        const baseTime = Math.max(now, existingUntil);
+        player.ext.criticalDebuffUntil = baseTime + 24 * 60 * 60 * 1000;
+        player.ext.criticalDebuffStacks = (player.ext.criticalDebuffStacks ?? 0) + 1;
+        logger?.info(`[Critical] 妖精 ${player.userId} 濒危复活！健康→60，debuff层数:${player.ext.criticalDebuffStacks}`);
+    } else {
+        // 普通种族：自动紧急救助（费用100×3=300，耗时4×3=12小时）
+        const emergencyCost = 300;
+        player.ext.gold = (player.ext.gold ?? 0) - emergencyCost;
+        player.ext.health = 20;
+        player.ext.criticalICUUntil = now + 12 * 60 * 60 * 1000;
+        logger?.info(`[Critical] 用户 ${player.userId} 进入ICU！金币-${emergencyCost}，健康→20，12小时后解除`);
+    }
+}
+
+/** 检查玩家是否在 ICU 中（普通种族濒危后锁定） */
+export function isInICU(player: PlayerData): boolean {
+    const until = player.ext.criticalICUUntil ?? 0;
+    if (until === 0) return false;
+    if (Date.now() >= until) {
+        // ICU 已到期，自动清除
+        player.ext.criticalICUUntil = 0;
+        return false;
+    }
+    return true;
+}
+
+/** 检查妖精濒危 debuff 是否生效 */
+export function isFairyDebuffActive(player: PlayerData): boolean {
+    const until = player.ext.criticalDebuffUntil ?? 0;
+    if (until === 0) return false;
+    if (Date.now() >= until) {
+        player.ext.criticalDebuffUntil = 0;
+        player.ext.criticalDebuffStacks = 0;
+        return false;
+    }
+    return true;
+}
+
+/** 获取妖精濒危 debuff 层数 */
+export function getFairyDebuffStacks(player: PlayerData): number {
+    return isFairyDebuffActive(player) ? (player.ext.criticalDebuffStacks ?? 0) : 0;
+}
+
+// ==================== 奖惩 Buff/Debuff ====================
+
+/** 心情 Buff（仅影响魅力和幸运的乘数） */
+export interface MoodBuffs {
+    chaMulti: number;   // 乘数加成（如 0.15 = +15%）
+    lucMulti: number;
+    chaFlat: number;    // 固定加成（如 +2）
+    lucFlat: number;
+}
+
+/** 健康 Debuff（影响力量/敏捷/智慧） */
+export interface HealthDebuffs {
+    strMulti: number;   // 乘数减益（如 -0.20 = -20%）
+    dexMulti: number;
+    intMulti: number;
+    strFlat: number;    // 固定减值
+    dexFlat: number;
+    intFlat: number;
+}
+
+/** 带 Buff/Debuff 后的有效属性 */
+export interface EffectiveStats {
+    str: number;
+    dex: number;
+    con: number;
+    int: number;
+    cha: number;
+    luc: number;
+    moodBuffs: MoodBuffs | null;
+    healthDebuffs: HealthDebuffs | null;
+    fairyDebuffStacks: number;  // 妖精濒危 debuff 层数
+}
+
+/**
+ * 获取心情 Buff（高心情增益 / 低心情减益）
+ */
+export function getMoodBuffs(player: PlayerData): MoodBuffs | null {
+    const cfg = pluginState.config;
+    const mood = player.ext.mood ?? 80;
+
+    if (mood >= cfg.highMoodThreshold) {
+        return { chaMulti: 0.15, lucMulti: 0.10, chaFlat: 2, lucFlat: 2 };
+    }
+    if (mood <= cfg.lowMoodThreshold) {
+        return { chaMulti: -0.15, lucMulti: -0.10, chaFlat: -2, lucFlat: -2 };
+    }
+    return null;
+}
+
+/**
+ * 获取健康 Debuff（低健康时触发）
+ */
+export function getHealthDebuffs(player: PlayerData): HealthDebuffs | null {
+    const cfg = pluginState.config;
+    const health = player.ext.health ?? 80;
+
+    if (health <= cfg.lowHealthThreshold) {
+        return {
+            strMulti: -0.20, dexMulti: -0.20, intMulti: -0.20,
+            strFlat: -2, dexFlat: -2, intFlat: -2,
+        };
+    }
+    return null;
+}
+
+/**
+ * 计算带 Buff/Debuff 后的有效属性值
+ * 用于展示和属性检查，不修改 base 数据
+ */
+export function getEffectiveStats(player: PlayerData): EffectiveStats {
+    const moodBuffs = getMoodBuffs(player);
+    const healthDebuffs = getHealthDebuffs(player);
+    const fairyStacks = getFairyDebuffStacks(player);
+
+    let str = player.base.str;
+    let dex = player.base.dex;
+    let con = player.base.con;
+    let int = player.base.int;
+    let cha = player.base.cha;
+    let luc = player.base.luc;
+
+    // 妖精濒危 debuff：每层全属性 -10% -1
+    if (fairyStacks > 0) {
+        const fairyMulti = 1 - 0.10 * fairyStacks;
+        const fairyFlat = -1 * fairyStacks;
+        str = Math.floor(str * fairyMulti) + fairyFlat;
+        dex = Math.floor(dex * fairyMulti) + fairyFlat;
+        con = Math.floor(con * fairyMulti) + fairyFlat;
+        int = Math.floor(int * fairyMulti) + fairyFlat;
+        cha = Math.floor(cha * fairyMulti) + fairyFlat;
+        luc = Math.floor(luc * fairyMulti) + fairyFlat;
+    }
+
+    if (moodBuffs) {
+        cha = Math.floor(cha * (1 + moodBuffs.chaMulti)) + moodBuffs.chaFlat;
+        luc = Math.floor(luc * (1 + moodBuffs.lucMulti)) + moodBuffs.lucFlat;
+    }
+
+    if (healthDebuffs) {
+        str = Math.floor(str * (1 + healthDebuffs.strMulti)) + healthDebuffs.strFlat;
+        dex = Math.floor(dex * (1 + healthDebuffs.dexMulti)) + healthDebuffs.dexFlat;
+        int = Math.floor(int * (1 + healthDebuffs.intMulti)) + healthDebuffs.intFlat;
+    }
+
+    return { str, dex, con, int, cha, luc, moodBuffs, healthDebuffs, fairyDebuffStacks: fairyStacks };
+}
+
+export function loadPlayer(userId: number): PlayerData | null {
+    const filePath = getPlayerFilePath(userId);
+    try {
+        if (fs.existsSync(filePath)) {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+            const player = migratePlayerData(data);
+            recalculateFinalStats(player);
+
+            // 应用自然平衡（心情/健康随时间恢复）
+            if (applyNaturalRegen(player)) {
+                savePlayer(player);
+            }
+
+            // 濒危检测：健康 <= 0 时自动处理
+            if ((player.ext.health ?? 80) <= 0) {
+                handleCriticalState(player);
+                savePlayer(player);
+            }
+
+            return player;
+        }
+    } catch (err) {
+        logger?.error(`[Player] 加载失败 ${userId}:`, err);
+    }
+    return null;
+}
+
+export function savePlayer(data: PlayerData): boolean {
+    try {
+        fs.writeFileSync(getPlayerFilePath(data.userId), JSON.stringify(data, null, 2), 'utf-8');
+        return true;
+    } catch (err) {
+        logger?.error(`[Player] 保存失败 ${data.userId}:`, err);
+        return false;
+    }
+}
+
+export function isPlayerExists(userId: number): boolean {
+    return fs.existsSync(getPlayerFilePath(userId));
+}
+
+export function deletePlayer(userId: number): boolean {
+    try {
+        const p = getPlayerFilePath(userId);
+        if (fs.existsSync(p)) { fs.unlinkSync(p); return true; }
+        return false;
+    } catch { return false; }
+}
+
+// ==================== 取整函数 ====================
+function floorStat(value: number): number {
+    if (value >= 0) {
+        return Math.floor(value);
+    } else {
+        return -Math.ceil(-value);
+    }
+}
+
+function calculateStat(midValue: number, multiplier: number): number {
+    if (midValue >= 0) {
+        return floorStat(midValue * multiplier);
+    } else {
+        const reversedMultiplier = 2 - multiplier;
+        return floorStat(midValue * reversedMultiplier);
+    }
+}
+
+// ==================== 最终值计算 ====================
+export function recalculateFinalStats(player: PlayerData): void {
+    player.base.str = calculateStat(player.base.midStr, player.base.strMulti);
+    player.base.dex = calculateStat(player.base.midDex, player.base.dexMulti);
+    player.base.con = calculateStat(player.base.midCon, player.base.conMulti);
+    player.base.int = calculateStat(player.base.midInt, player.base.intMulti);
+    player.base.cha = calculateStat(player.base.midCha, player.base.chaMulti);
+    player.base.luc = calculateStat(player.base.midLuc, player.base.lucMulti);
+}
+
+// ==================== 属性升级 ====================
+export interface UpgradeResult {
+    success: boolean;
+    message: string;
+    oldMidValue: number;
+    newMidValue: number;
+    newFinalValue: number;
+    remainingPoints: number;
+}
+
+export function upgradeMidStat(
+    player: PlayerData,
+    attrKey: string,
+    points: number
+): UpgradeResult {
+    const freePoints = player.ext.freePoints ?? 0;
+    if (freePoints < points) {
+        return { 
+            success: false, 
+            message: `自由点不足！需要 ${points} 点，当前只有 ${freePoints} 点`,
+            oldMidValue: 0,
+            newMidValue: 0,
+            newFinalValue: 0,
+            remainingPoints: freePoints
+        };
+    }
+    
+    const midKey = `mid${attrKey.charAt(0).toUpperCase() + attrKey.slice(1)}`;
+    const oldMid = (player.base as any)[midKey];
+    (player.base as any)[midKey] = oldMid + points;
+    player.ext.freePoints = freePoints - points;
+    
+    recalculateFinalStats(player);
+    
+    const finalKey = attrKey;
+    const newFinal = (player.base as any)[finalKey];
+    
+    return { 
+        success: true, 
+        message: `${attrKey.toUpperCase()} 升级 +${points}！`,
+        oldMidValue: oldMid,
+        newMidValue: oldMid + points,
+        newFinalValue: newFinal,
+        remainingPoints: player.ext.freePoints ?? 0
+    };
+}
+
+// ==================== 体型计算 ====================
+export function calculateSize(kindId: number, formId: number, raceIds: number[]): number {
+    const kind = KINDS[kindId];
+    const form = FORMS[formId];
+    
+    let size = kind.baseSize + form.sizeBonus;
+    
+    const hasDragon = raceIds.some(id => RACES[id].isDragon === true);
+    
+    if (hasDragon) {
+        const specialBonus = RACE_SIZE_BONUSES.find(b => b.kindId === kindId && b.formId === formId);
+        if (specialBonus) {
+            size += specialBonus.extraBonus;
+        }
+    }
+    
+    return Math.max(1, size);
+}
+
+// ==================== 初始属性计算 ====================
+export function calculateInitialStats(
+    kindId: number,
+    genderId: number,
+    raceIds: number[],
+    formId: number
+): {
+    midStr: number; midDex: number; midCon: number; midInt: number; midCha: number; midLuc: number;
+    strMulti: number; dexMulti: number; conMulti: number; intMulti: number; chaMulti: number; lucMulti: number;
+    mixedRaceName?: string;
+    size: number;
+} {
+    const kind = KINDS[kindId];
+    const gender = GENDERS[genderId];
+    
+    let strBonus = kind.strBonus + gender.strBonus;
+    let dexBonus = kind.dexBonus + gender.dexBonus;
+    let conBonus = kind.conBonus + gender.conBonus;
+    let intBonus = kind.intBonus + gender.intBonus;
+    let chaBonus = kind.chaBonus + gender.chaBonus;
+    let lucBonus = kind.lucBonus + gender.lucBonus;
+    
+    let strMulti = 0, dexMulti = 0, conMulti = 0, intMulti = 0, chaMulti = 0, lucMulti = 0;
+    
+    for (const raceId of raceIds) {
+        const race = RACES[raceId];
+        strBonus += race.strBonus;
+        dexBonus += race.dexBonus;
+        conBonus += race.conBonus;
+        intBonus += race.intBonus;
+        chaBonus += race.chaBonus;
+        lucBonus += race.lucBonus;
+        strMulti += (race.strMulti - 1);
+        dexMulti += (race.dexMulti - 1);
+        conMulti += (race.conMulti - 1);
+        intMulti += (race.intMulti - 1);
+        chaMulti += (race.chaMulti - 1);
+        lucMulti += (race.lucMulti - 1);
+    }
+    
+    const mixedBonus = getMixedRaceBonus(raceIds);
+    let mixedRaceName: string | undefined = undefined;
+    
+    if (mixedBonus) {
+        mixedRaceName = mixedBonus.name;
+        strBonus += mixedBonus.strBonus;
+        dexBonus += mixedBonus.dexBonus;
+        conBonus += mixedBonus.conBonus;
+        intBonus += mixedBonus.intBonus;
+        chaBonus += mixedBonus.chaBonus;
+        lucBonus += mixedBonus.lucBonus;
+        strMulti += mixedBonus.strMulti;
+        dexMulti += mixedBonus.dexMulti;
+        conMulti += mixedBonus.conMulti;
+        intMulti += mixedBonus.intMulti;
+        chaMulti += mixedBonus.chaMulti;
+        lucMulti += mixedBonus.lucMulti;
+    }
+    
+    const finalStrMulti = 1 + strMulti;
+    const finalDexMulti = 1 + dexMulti;
+    const finalConMulti = 1 + conMulti;
+    const finalIntMulti = 1 + intMulti;
+    const finalChaMulti = 1 + chaMulti;
+    const finalLucMulti = 1 + lucMulti;
+    
+    const midStr = BASE_STAT + strBonus;
+    const midDex = BASE_STAT + dexBonus;
+    const midCon = BASE_STAT + conBonus;
+    const midInt = BASE_STAT + intBonus;
+    const midCha = BASE_STAT + chaBonus;
+    const midLuc = BASE_STAT + lucBonus;
+    
+    const size = calculateSize(kindId, formId, raceIds);
+    
+    return {
+        midStr, midDex, midCon, midInt, midCha, midLuc,
+        strMulti: finalStrMulti, dexMulti: finalDexMulti, conMulti: finalConMulti,
+        intMulti: finalIntMulti, chaMulti: finalChaMulti, lucMulti: finalLucMulti,
+        mixedRaceName,
+        size
+    };
+}
+
+// ==================== 创建新玩家 ====================
+export function createPlayer(
+    userId: number,
+    nickname: string,
+    kindId: number,
+    genderId: number,
+    formId: number,
+    raceIds: number[]
+): PlayerData | null {
+    const kind = KINDS[kindId];
+    const gender = GENDERS[genderId];
+    const form = FORMS[formId];
+    
+    const stats = calculateInitialStats(kindId, genderId, raceIds, formId);
+    
+    const player: PlayerData = {
+        version: 3,
+        userId,
+        nickname,
+        kindId: kind.id,
+        kindName: kind.name,
+        genderId: gender.id,
+        genderName: gender.name,
+        formId: form.id,
+        formName: form.name,
+        races: [...new Set(raceIds)],
+        mixedRaceName: stats.mixedRaceName,
+        size: stats.size,
+        createdAt: Date.now(),
+        lastActive: Date.now(),
+        base: {
+            midStr: stats.midStr,
+            midDex: stats.midDex,
+            midCon: stats.midCon,
+            midInt: stats.midInt,
+            midCha: stats.midCha,
+            midLuc: stats.midLuc,
+            str: 0, dex: 0, con: 0, int: 0, cha: 0, luc: 0,
+            strMulti: stats.strMulti,
+            dexMulti: stats.dexMulti,
+            conMulti: stats.conMulti,
+            intMulti: stats.intMulti,
+            chaMulti: stats.chaMulti,
+            lucMulti: stats.lucMulti
+        },
+        ext: {
+            gold: 200,
+            mood: 80,
+            health: 80,
+            freePoints: 3,
+            items: [],
+            bookUseCount: {},
+            discountStack: 0,
+            advData: {},
+            workData: {},
+            lastRegenPeriod: getCurrentRegenPeriod(),
+            criticalICUUntil: 0,
+            criticalDebuffUntil: 0,
+            criticalDebuffStacks: 0,
+        }
+    };
+    
+    recalculateFinalStats(player);
+    
+    return player;
+}
+
+// ==================== 辅助访问函数 ====================
+// 提供便捷的属性访问方法，同时保持向后兼容
+
+export function getMoney(player: PlayerData): number {
+    return player.ext.gold ?? 0;
+}
+
+export function setMoney(player: PlayerData, value: number): void {
+    player.ext.gold = value;
+}
+
+export function addMoney(player: PlayerData, delta: number): void {
+    player.ext.gold = (player.ext.gold ?? 0) + delta;
+}
+
+export function getMood(player: PlayerData): number {
+    return player.ext.mood ?? 80;
+}
+
+export function setMood(player: PlayerData, value: number): void {
+    player.ext.mood = Math.max(0, Math.min(100, value));
+}
+
+export function addMood(player: PlayerData, delta: number): void {
+    player.ext.mood = Math.max(0, Math.min(100, (player.ext.mood ?? 80) + delta));
+}
+
+export function getHealth(player: PlayerData): number {
+    return player.ext.health ?? 80;
+}
+
+export function setHealth(player: PlayerData, value: number): void {
+    player.ext.health = Math.max(0, Math.min(100, value));
+}
+
+export function addHealth(player: PlayerData, delta: number): void {
+    player.ext.health = Math.min(100, (player.ext.health ?? 80) + delta);
+}
+
+export function getFreePoints(player: PlayerData): number {
+    return player.ext.freePoints ?? 0;
+}
+
+export function setFreePoints(player: PlayerData, value: number): void {
+    player.ext.freePoints = value;
+}
+
+export function addFreePoints(player: PlayerData, delta: number): void {
+    player.ext.freePoints = (player.ext.freePoints ?? 0) + delta;
+}
+
+export function getItems(player: PlayerData): Array<{ id: number; quantity: number }> {
+    return player.ext.items ?? [];
+}
+
+export function getDiscountStack(player: PlayerData): number {
+    return player.ext.discountStack ?? 0;
+}
+
+export function setDiscountStack(player: PlayerData, value: number): void {
+    player.ext.discountStack = value;
+}
+
+export function addDiscountStack(player: PlayerData, delta: number): void {
+    player.ext.discountStack = (player.ext.discountStack ?? 0) + delta;
+}
+
+// ==================== 导出 ====================
+export { KINDS, GENDERS, FORMS, RACES };

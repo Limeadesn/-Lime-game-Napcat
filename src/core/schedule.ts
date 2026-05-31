@@ -1,0 +1,299 @@
+// src/core/schedule.ts
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { loadPlayer, savePlayer, addMoney } from './player';
+import { getWorkById, WORK_LIST } from '../works/index';
+import { getAdvById, incrementAdvCompletedCount, ADV_LIST } from '../adv/index';
+import type { WorkContext } from '../works/types';
+import type { AdvContext } from '../adv/types';
+
+// ==================== 工作类型定义 ====================
+
+export interface WorkInfo {
+    id: number;
+    name: string;
+    description: string;
+    type: 'I' | 'II';
+    duration: number;
+    attribute: string;
+    attrRequirement: number;
+    basePay?: number;
+}
+
+// ==================== 历练类型定义 ====================
+
+export interface AdvInfo {
+    id: number;
+    name: string;
+    description: string;
+    duration: number;
+    cost: number;
+    maxCount?: number;
+}
+
+// ==================== 日程数据类型 ====================
+
+export interface ScheduleItem {
+    userId: number;
+    type: 'work' | 'adv';
+    workId?: number;
+    advId?: number;
+    startTime: number;
+    endTime: number;
+}
+
+export interface SchedulesData {
+    schedules: ScheduleItem[];
+}
+
+// ==================== 存储路径 ====================
+
+let schedulesPath: string = '';
+let logger: any = null;
+
+export function initScheduleStorage(ctx: any, dataPath: string): void {
+    logger = ctx.logger;
+    schedulesPath = path.join(dataPath, 'schedules.json');
+    if (!fs.existsSync(schedulesPath)) {
+        saveSchedulesData({ schedules: [] });
+    }
+    logger.info('[Schedule] 日程存储模块已初始化');
+}
+
+function loadSchedulesData(): SchedulesData {
+    try {
+        if (fs.existsSync(schedulesPath)) {
+            const content = fs.readFileSync(schedulesPath, 'utf-8');
+            return JSON.parse(content);
+        }
+    } catch (err) {
+        logger?.error('[Schedule] 加载日程数据失败:', err);
+    }
+    return { schedules: [] };
+}
+
+function saveSchedulesData(data: SchedulesData): void {
+    try {
+        fs.writeFileSync(schedulesPath, JSON.stringify(data, null, 2), 'utf-8');
+    } catch (err) {
+        logger?.error('[Schedule] 保存日程数据失败:', err);
+    }
+}
+
+// ==================== 工作列表（从 works/index.ts 导入，单一数据源） ====================
+
+// 获取工作信息
+export function getWorkInfoById(id: number): WorkInfo | undefined {
+    return WORK_LIST.find(w => w.id === id);
+}
+
+// 获取所有工作信息
+export function getAllWorkInfos(): WorkInfo[] {
+    return [...WORK_LIST];
+}
+
+// 获取历练信息
+export function getAdvInfoById(id: number): AdvInfo | undefined {
+    return ADV_LIST.find(a => a.id === id);
+}
+
+// 获取所有历练信息
+export function getAllAdvInfos(): AdvInfo[] {
+    return [...ADV_LIST];
+}
+
+// ==================== 日程操作 ====================
+
+export function getUserActiveSchedule(userId: number): ScheduleItem | null {
+    const data = loadSchedulesData();
+    return data.schedules.find(s => s.userId === userId) || null;
+}
+
+export function addSchedule(userId: number, id: number, duration: number, type: 'work' | 'adv'): boolean {
+    const data = loadSchedulesData();
+
+    // 在同一数据快照中检查并添加，避免读-改-写竞态
+    if (data.schedules.some(s => s.userId === userId)) {
+        return false;
+    }
+
+    const schedule: ScheduleItem = {
+        userId,
+        type,
+        startTime: Date.now(),
+        endTime: Date.now() + duration * 60 * 60 * 1000
+    };
+
+    if (type === 'work') {
+        schedule.workId = id;
+    } else {
+        schedule.advId = id;
+    }
+
+    data.schedules.push(schedule);
+    saveSchedulesData(data);
+    return true;
+}
+
+export function removeSchedule(userId: number): boolean {
+    const data = loadSchedulesData();
+    const index = data.schedules.findIndex(s => s.userId === userId);
+    if (index === -1) return false;
+    data.schedules.splice(index, 1);
+    saveSchedulesData(data);
+    return true;
+}
+
+// ==================== 工作结算 ====================
+
+// 获取属性值
+function getAttributeValue(player: any, attr: string): number {
+    switch (attr) {
+        case 'str': return player.base.str;
+        case 'dex': return player.base.dex;
+        case 'con': return player.base.con;
+        case 'int': return player.base.int;
+        case 'cha': return player.base.cha;
+        case 'luc': return player.base.luc;
+        default: return 0;
+    }
+}
+
+// 结算日程
+export async function settleSchedule(schedule: ScheduleItem): Promise<{ completed: boolean; message: string }> {
+    if (schedule.type === 'work' && schedule.workId) {
+        const work = await getWorkById(schedule.workId);
+        if (!work) {
+            return { completed: false, message: '工作不存在' };
+        }
+        
+        const player = loadPlayer(schedule.userId);
+        if (!player) {
+            return { completed: false, message: '玩家数据不存在' };
+        }
+        
+        // 执行工作结算
+        const ctx: WorkContext = {
+            userId: schedule.userId,
+            player,
+            duration: work.duration,
+            sendReply: async () => {}
+        };
+        
+        const result = await work.settle(ctx);
+        
+        if (!result.success) {
+            return { completed: false, message: result.message };
+        }
+        
+        return { completed: true, message: result.message };
+        
+    } else if (schedule.type === 'adv' && schedule.advId) {
+        const adv = await getAdvById(schedule.advId);
+        if (!adv) {
+            return { completed: false, message: '历练不存在' };
+        }
+
+        const player = loadPlayer(schedule.userId);
+        if (!player) {
+            return { completed: false, message: '玩家数据不存在' };
+        }
+
+        // 执行历练结算（条件判定已在 .adv select 时完成）
+        const ctx: AdvContext = {
+            userId: schedule.userId,
+            player,
+            sendReply: async () => {}
+        };
+        
+        const result = await adv.settle(ctx);
+        
+        if (!result.success) {
+            return { completed: false, message: result.message };
+        }
+        
+        // 增加完成次数
+        incrementAdvCompletedCount(player, schedule.advId);
+        
+        return { completed: true, message: result.message };
+    }
+    
+    return { completed: false, message: '未知日程类型' };
+}
+
+// 检测并结算所有到期日程
+export async function checkAndSettleSchedules(ctx: any, sendReply: (userId: number, msg: string) => Promise<void>): Promise<void> {
+    const data = loadSchedulesData();
+    const now = Date.now();
+    const completedSchedules: ScheduleItem[] = [];
+    const remainingSchedules: ScheduleItem[] = [];
+    
+    for (const schedule of data.schedules) {
+        if (schedule.endTime <= now) {
+            completedSchedules.push(schedule);
+        } else {
+            remainingSchedules.push(schedule);
+        }
+    }
+    
+    if (completedSchedules.length > 0) {
+        data.schedules = remainingSchedules;
+        saveSchedulesData(data);
+
+        for (const schedule of completedSchedules) {
+            try {
+                const result = await settleSchedule(schedule);
+                if (result.completed) {
+                    await sendReply(schedule.userId, result.message);
+                    logger?.info(`[Schedule] 用户 ${schedule.userId} ${schedule.type === 'work' ? '工作' : '历练'}完成`);
+                } else {
+                    logger?.error(`[Schedule] 用户 ${schedule.userId} ${schedule.type === 'work' ? '工作' : '历练'}结算失败: ${result.message}`);
+                }
+            } catch (err) {
+                logger?.error(`[Schedule] 用户 ${schedule.userId} 结算异常，已跳过:`, err);
+            }
+        }
+    }
+}
+
+// 手动检测用户日程
+export async function checkUserSchedule(userId: number): Promise<{ hasSchedule: boolean; completed: boolean; message: string; endTime?: number }> {
+    const schedule = getUserActiveSchedule(userId);
+    if (!schedule) {
+        return { hasSchedule: false, completed: false, message: '你当前没有进行中的日程' };
+    }
+    
+    const now = Date.now();
+    if (schedule.endTime <= now) {
+        const result = await settleSchedule(schedule);
+        if (result.completed) {
+            removeSchedule(userId);
+            return { hasSchedule: true, completed: true, message: result.message };
+        } else {
+            return { hasSchedule: true, completed: false, message: result.message };
+        }
+    } else {
+        const remainingMs = schedule.endTime - now;
+        const remainingHours = Math.floor(remainingMs / (60 * 60 * 1000));
+        const remainingMinutes = Math.floor((remainingMs % (60 * 60 * 1000)) / (60 * 1000));
+        
+        let itemName = '';
+        if (schedule.type === 'work' && schedule.workId) {
+            const workInfo = getWorkInfoById(schedule.workId);
+            itemName = workInfo ? workInfo.name : '';
+        } else if (schedule.type === 'adv' && schedule.advId) {
+            const advInfo = getAdvInfoById(schedule.advId);
+            itemName = advInfo ? advInfo.name : '';
+        }
+        
+        const typeName = schedule.type === 'work' ? '工作' : '历练';
+        
+        return { 
+            hasSchedule: true, 
+            completed: false, 
+            message: `${typeName}“${itemName}”进行中，还需 ${remainingHours}小时${remainingMinutes}分钟`,
+            endTime: schedule.endTime
+        };
+    }
+}

@@ -1,0 +1,156 @@
+// src/commands/adv.ts
+
+import type { NapCatPluginContext } from 'napcat-types/napcat-onebot/network/plugin/types';
+import { initPlayerStorage, isPlayerExists, loadPlayer, savePlayer, getMoney, addMoney } from '../core/player';
+import { initScheduleStorage, getUserActiveSchedule, addSchedule, getAllAdvInfos, getAdvInfoById } from '../core/schedule';
+import { getAdvCompletedCount } from '../adv/index';
+
+let initialized = false;
+
+export async function handleAdv(
+    ctx: NapCatPluginContext,
+    event: any,
+    sendReply: (msg: string) => Promise<void>
+): Promise<void> {
+    if (!initialized) {
+        initPlayerStorage(ctx, ctx.dataPath);
+        initScheduleStorage(ctx, ctx.dataPath);
+        initialized = true;
+    }
+    
+    const userId = event.user_id;
+    const args = (event.args || '').trim();
+    const parts = args.split(/\s+/);
+    const action = parts[0]?.toLowerCase() || '';
+    
+    if (!isPlayerExists(userId)) {
+        await sendReply(`[错误] 你还没有注册角色！请先使用 .reg 命令注册~`);
+        return;
+    }
+    
+    // .adv list
+    if (action === 'list') {
+        const advs = getAllAdvInfos();
+        const lines: string[] = ['[历练列表]'];
+        const player = loadPlayer(userId);
+        
+        for (const adv of advs) {
+            let status = '';
+            if (player && adv.maxCount) {
+                const completedCount = getAdvCompletedCount(player, adv.id);
+                const remaining = adv.maxCount - completedCount;
+                if (remaining <= 0) {
+                    status = ' [已完成]';
+                } else {
+                    status = ` [剩余${remaining}次]`;
+                }
+            }
+            lines.push(`${adv.id}. ${adv.name}${status}`);
+            lines.push(`   时长:${adv.duration}小时 消耗:${adv.cost}金币`);
+            lines.push(`   ${adv.description}`);
+        }
+        await sendReply(lines.join('\n'));
+        return;
+    }
+    
+    // .adv select
+    if (action === 'select') {
+        if (parts.length < 2) {
+            await sendReply(`[错误] 格式错误！正确格式: .adv select <历练ID>`);
+            return;
+        }
+        
+        const advId = parseInt(parts[1], 10);
+        if (isNaN(advId)) {
+            await sendReply(`[错误] 历练ID必须是数字！`);
+            return;
+        }
+        
+        const advInfo = getAdvInfoById(advId);
+        
+        if (!advInfo) {
+            await sendReply(`[错误] 历练不存在！使用 .adv list 查看可用历练`);
+            return;
+        }
+        
+        const existingSchedule = getUserActiveSchedule(userId);
+        if (existingSchedule) {
+            await sendReply(`[错误] 你已有进行中的日程！请等待完成或使用 .schedule cancel 取消`);
+            return;
+        }
+        
+        const player = loadPlayer(userId);
+        if (!player) {
+            await sendReply(`[错误] 获取玩家数据失败！`);
+            return;
+        }
+        
+        // 检查金币是否足够
+        const currentMoney = getMoney(player);
+        if (currentMoney < advInfo.cost) {
+            await sendReply(`[错误] 金币不足！需要${advInfo.cost}金币，当前${currentMoney}金币`);
+            return;
+        }
+        
+        // 检查次数限制
+        if (advInfo.maxCount) {
+            const completedCount = getAdvCompletedCount(player, advId);
+            if (completedCount >= advInfo.maxCount) {
+                await sendReply(`[错误] 你已经完成了${advInfo.maxCount}次，无法继续`);
+                return;
+            }
+        }
+        
+        // 检查特殊属性要求
+        if (advId === 1) {
+            if (player.base.int >= 2) {
+                await sendReply(`[错误] 智慧已经足够，不需要扫盲了`);
+                return;
+            }
+        }
+        if (advId === 3) {
+            const mood = player.ext.mood ?? 80;
+            if (mood >= 20) {
+                await sendReply(`[错误] 心情还不够低，不需要心理辅导`);
+                return;
+            }
+        }
+        if (advId === 4) {
+            const health = player.ext.health ?? 80;
+            if (health >= 20) {
+                await sendReply(`[错误] 健康度还不够低，不需要紧急救助`);
+                return;
+            }
+        }
+        
+        // 扣除金币
+        addMoney(player, -advInfo.cost);
+        player.lastActive = Date.now();
+        
+        if (!savePlayer(player)) {
+            await sendReply(`[错误] 保存玩家数据失败！`);
+            return;
+        }
+        
+        if (addSchedule(userId, advId, advInfo.duration, 'adv')) {
+            const endTime = new Date(Date.now() + advInfo.duration * 60 * 60 * 1000);
+            await sendReply(`[历练开始] 你开始了“${advInfo.name}”
+消耗：${advInfo.cost}金币
+预计完成时间：${endTime.toLocaleString()}
+可使用 .user check 查看进度，使用 .schedule cancel 取消`);
+            ctx.logger.info(`[Adv] 用户 ${userId} 开始历练: ${advInfo.name}`);
+        } else {
+            // 回滚金币
+            addMoney(player, advInfo.cost);
+            savePlayer(player);
+            await sendReply(`[错误] 无法开始历练，请稍后重试`);
+        }
+        return;
+    }
+    
+    // 帮助
+    await sendReply(`[历练指令]
+.adv list - 查看所有历练
+.adv select <历练ID> - 开始历练
+.schedule cancel - 取消当前历练`);
+}

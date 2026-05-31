@@ -1,0 +1,672 @@
+// src/commands/dyq.ts
+
+import type { NapCatPluginContext } from 'napcat-types/napcat-onebot/network/plugin/types';
+import { initPlayerStorage, isPlayerExists, loadPlayer, savePlayer, getMoney, addMoney } from '../core/player';
+
+// ==================== 类型定义 ====================
+
+interface Player {
+    userId: number;
+    nickname: string;
+    successCount: number;
+    isAlive: boolean;
+    isSystem: boolean;
+}
+
+interface GameState {
+    isActive: boolean;
+    players: Player[];
+    systemPlayers: Player[];
+    allPlayers: Player[];
+    currentTurnIndex: number;
+    gameFish: string[];
+    unusedFish: string[];
+    missingFish: string[];
+    order: number[];
+    gameStartTime: number;
+    groupId: number;
+    creatorId: number;
+    totalPrizePool: number;
+}
+
+// ==================== 全局变量 ====================
+
+let currentGame: GameState | null = null;
+
+// ==================== 总鱼池配置 ====================
+
+const TOTAL_FISH_POOL: string[] = [
+    "幽匿鳟鱼", "冰霜鳕鱼", "岩浆鳗鱼", "死眼比目鱼", "冰冻罗非鱼",
+    "霓虹锦鲤", "暗影鱼", "填充草药鱼", "兔兔鱼", "克苏鲁眼鱼",
+    "坠落星鱼", "臭鳜鱼", "西湖醋鱼", "向日葵锦鲤", "传说鱼王",
+    "博比特虫", "黑曜石鱼", "闪耀锦鲤", "萨卡班甲鱼", "Gura小鲨鱼",
+    "寰宇星鱼", "七星鱼", "银鱼", "金鱼", "雷管鱼"
+];
+
+const SYSTEM_NAMES: string[] = [
+    "艾薇医生", "格拉迪亚图斯", "召唤师", "神秘渔夫", "戴维",
+    "巫妖王", "疫医", "海伦凯勒", "威利", "老人与海的老人"
+];
+
+const ENTRY_FEE = 50;
+const SYSTEM_ENTRY_FEE = 20;
+const MESSAGE_DELAY_MS = 3000;
+
+// ==================== 工具函数 ====================
+
+function getRandomSystemName(usedNames: string[]): string {
+    const available = SYSTEM_NAMES.filter(n => !usedNames.includes(n));
+    if (available.length === 0) return `机器人${usedNames.length + 1}`;
+    return available[Math.floor(Math.random() * available.length)];
+}
+
+function shuffleArray<T>(arr: T[]): T[] {
+    const shuffled = [...arr];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    return shuffled;
+}
+
+function drawRandomFish(count: number): string[] {
+    const shuffled = shuffleArray([...TOTAL_FISH_POOL]);
+    return shuffled.slice(0, count);
+}
+
+function delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function isAdminOrOwner(ctx: NapCatPluginContext, groupId: number, userId: number): Promise<boolean> {
+    try {
+        const memberInfo = await ctx.actions.call('get_group_member_info', {
+            group_id: groupId,
+            user_id: userId
+        }, ctx.adapterName, ctx.pluginManager.config);
+        const role = memberInfo?.role;
+        return role === 'owner' || role === 'admin';
+    } catch (e) {
+        return false;
+    }
+}
+
+function getRegisteredNickname(userId: number): string | null {
+    const playerData = loadPlayer(userId);
+    if (!playerData) return null;
+    return playerData.nickname;
+}
+
+// ==================== 游戏初始化 ====================
+
+async function initGame(ctx: NapCatPluginContext, groupId: number, creatorId: number): Promise<void> {
+    const creatorNickname = getRegisteredNickname(creatorId);
+    if (!creatorNickname) return;
+    
+    const players: Player[] = [{ userId: creatorId, nickname: creatorNickname, successCount: 0, isAlive: true, isSystem: false }];
+    
+    currentGame = {
+        isActive: false,
+        players,
+        systemPlayers: [],
+        allPlayers: [],
+        currentTurnIndex: 0,
+        gameFish: [],
+        unusedFish: [],
+        missingFish: [],
+        order: [],
+        gameStartTime: Date.now(),
+        groupId: groupId,
+        creatorId: creatorId,
+        totalPrizePool: 0
+    };
+    
+    ctx.logger.info(`[DYQ] 游戏在群 ${groupId} 创建，创建者: ${creatorNickname}`);
+}
+
+function addSystemPlayersToTarget(targetCount: number): void {
+    if (!currentGame) return;
+    
+    const currentTotal = currentGame.players.length + currentGame.systemPlayers.length;
+    const needed = targetCount - currentTotal;
+    
+    if (needed > 0) {
+        const usedNames = [...currentGame.players.map(p => p.nickname), ...currentGame.systemPlayers.map(p => p.nickname)];
+        for (let i = 0; i < needed; i++) {
+            const sysPlayer: Player = {
+                userId: -100 - (currentGame.systemPlayers.length + i),
+                nickname: getRandomSystemName(usedNames),
+                successCount: 0,
+                isAlive: true,
+                isSystem: true
+            };
+            usedNames.push(sysPlayer.nickname);
+            currentGame.systemPlayers.push(sysPlayer);
+        }
+    }
+}
+
+async function deductEntryFee(ctx: NapCatPluginContext, player: Player): Promise<boolean> {
+    if (!currentGame) return false;
+    
+    if (player.isSystem) {
+        currentGame.totalPrizePool += SYSTEM_ENTRY_FEE;
+        return true;
+    }
+    
+    const playerData = loadPlayer(player.userId);
+    if (!playerData) {
+        return false;
+    }
+    
+    if (getMoney(playerData) < ENTRY_FEE) {
+        return false;
+    }
+    
+    addMoney(playerData, -ENTRY_FEE);
+    playerData.lastActive = Date.now();
+    
+    if (!savePlayer(playerData)) {
+        return false;
+    }
+    
+    currentGame.totalPrizePool += ENTRY_FEE;
+    return true;
+}
+
+async function startGameLogic(ctx: NapCatPluginContext, reply: (msg: string) => Promise<void>): Promise<void> {
+    const game = currentGame;
+    if (!game) return;
+    
+    const failedPlayers: string[] = [];
+    for (const player of game.players) {
+        if (!player.isSystem) {
+            const playerData = loadPlayer(player.userId);
+            if (!playerData || getMoney(playerData) < ENTRY_FEE) {
+                failedPlayers.push(player.nickname);
+            }
+        }
+    }
+    
+    if (failedPlayers.length > 0) {
+        await reply(`[错误] 以下玩家金币不足${ENTRY_FEE}，无法开始游戏：${failedPlayers.join('、')}`);
+        return;
+    }
+    
+    for (const player of game.players) {
+        await deductEntryFee(ctx, player);
+    }
+    
+    const updatedGame = currentGame;
+    if (!updatedGame) return;
+    
+    const currentTotal = updatedGame.players.length + updatedGame.systemPlayers.length;
+    if (currentTotal < 5) {
+        addSystemPlayersToTarget(5);
+        if (currentGame) {
+            for (const sysPlayer of currentGame.systemPlayers) {
+                await deductEntryFee(ctx, sysPlayer);
+            }
+        }
+    }
+    
+    const finalGame = currentGame;
+    if (!finalGame) return;
+    
+    finalGame.allPlayers = [...finalGame.players, ...finalGame.systemPlayers];
+    const playerCount = finalGame.allPlayers.length;
+    
+    finalGame.order = shuffleArray([...Array(playerCount).keys()]);
+    finalGame.currentTurnIndex = 0;
+    
+    const fishCount = playerCount * 2;
+    finalGame.gameFish = drawRandomFish(fishCount);
+    finalGame.unusedFish = [...finalGame.gameFish];
+    
+    const shuffledFish = shuffleArray([...finalGame.gameFish]);
+    finalGame.missingFish = shuffledFish.slice(0, playerCount - 1);
+    
+    finalGame.isActive = true;
+    finalGame.gameStartTime = Date.now();
+    
+    const orderedPlayerNames = finalGame.order.map(idx => finalGame.allPlayers[idx].nickname);
+    const playerList = orderedPlayerNames.map((name, i) => `${i + 1}. ${name}`).join('\n');
+    
+    await reply(`钓鱼趣游戏开始！
+----------------------------------------
+参与者：${playerCount}人
+${playerList}
+----------------------------------------
+奖池总额：${finalGame.totalPrizePool}金币
+----------------------------------------
+本轮鱼类池（共${fishCount}种鱼）：
+${finalGame.gameFish.join('、')}
+----------------------------------------`);
+    
+    await delay(MESSAGE_DELAY_MS);
+    await showTurnInfo(reply);
+    
+    ctx.logger.info(`[DYQ] 游戏开始，玩家数: ${playerCount}，奖池: ${finalGame.totalPrizePool}`);
+}
+
+async function showTurnInfo(reply: (msg: string) => Promise<void>): Promise<void> {
+    const game = currentGame;
+    if (!game || !game.isActive) return;
+    
+    while (game.currentTurnIndex < game.order.length && 
+           !game.allPlayers[game.order[game.currentTurnIndex]].isAlive) {
+        game.currentTurnIndex++;
+    }
+    
+    if (game.currentTurnIndex >= game.order.length) {
+        game.currentTurnIndex = 0;
+        while (game.currentTurnIndex < game.order.length && 
+               !game.allPlayers[game.order[game.currentTurnIndex]].isAlive) {
+            game.currentTurnIndex++;
+        }
+    }
+    
+    const currentPlayer = game.allPlayers[game.order[game.currentTurnIndex]];
+    const unusedFishList = game.unusedFish.length > 0 ? game.unusedFish.join('、') : '无';
+    
+    await reply(`当前轮到：${currentPlayer.nickname}
+未猜测的鱼：${unusedFishList}
+输入 .dyq [鱼名] 询问对方有没有这条鱼`);
+}
+
+function moveToNextAlivePlayer(): void {
+    const game = currentGame;
+    if (!game) return;
+    
+    game.currentTurnIndex++;
+    
+    while (game.currentTurnIndex < game.order.length) {
+        if (game.allPlayers[game.order[game.currentTurnIndex]].isAlive) {
+            return;
+        }
+        game.currentTurnIndex++;
+    }
+    
+    game.currentTurnIndex = 0;
+    while (game.currentTurnIndex < game.order.length) {
+        if (game.allPlayers[game.order[game.currentTurnIndex]].isAlive) {
+            return;
+        }
+        game.currentTurnIndex++;
+    }
+}
+
+function eliminatePlayer(playerIdx: number): void {
+    const game = currentGame;
+    if (!game) return;
+    game.allPlayers[playerIdx].isAlive = false;
+}
+
+function checkGameEnd(): boolean {
+    const game = currentGame;
+    if (!game) return true;
+    const aliveRealPlayers = game.allPlayers.filter(p => p.isAlive && !p.isSystem);
+    return aliveRealPlayers.length === 0;
+}
+
+function getRandomWinnerFromSystems(): Player | null {
+    const game = currentGame;
+    if (!game) return null;
+    const aliveSystems = game.allPlayers.filter(p => p.isAlive && p.isSystem);
+    if (aliveSystems.length === 0) return null;
+    const randomIndex = Math.floor(Math.random() * aliveSystems.length);
+    return aliveSystems[randomIndex];
+}
+
+async function endGame(ctx: NapCatPluginContext, reply: (msg: string) => Promise<void>): Promise<void> {
+    const game = currentGame;
+    if (!game) return;
+    
+    const alivePlayers = game.allPlayers.filter(p => p.isAlive);
+    const aliveRealPlayers = alivePlayers.filter(p => !p.isSystem);
+    
+    let winner: Player | null = null;
+    
+    if (aliveRealPlayers.length > 0) {
+        const sorted = [...aliveRealPlayers].sort((a, b) => b.successCount - a.successCount);
+        winner = sorted[0];
+    } else {
+        winner = getRandomWinnerFromSystems();
+    }
+    
+    if (winner) {
+        const winnerPrize = Math.floor(game.totalPrizePool * 0.5);
+        
+        if (!winner.isSystem) {
+            const playerData = loadPlayer(winner.userId);
+            if (playerData) {
+                addMoney(playerData, winnerPrize);
+                savePlayer(playerData);
+            }
+        }
+        
+        await reply(`游戏结束！
+----------------------------------------
+胜者：${winner.nickname}
+获得奖金：${winnerPrize}金币
+----------------------------------------`);
+        
+        ctx.logger.info(`[DYQ] 游戏结束，胜者: ${winner.nickname}，奖金: ${winnerPrize}`);
+    } else {
+        await reply(`游戏结束！没有胜者产生。`);
+    }
+    
+    currentGame = null;
+}
+
+async function stopGame(ctx: NapCatPluginContext, reply: (msg: string) => Promise<void>): Promise<void> {
+    if (!currentGame) {
+        await reply(`没有进行中的游戏~`);
+        return;
+    }
+    
+    await reply(`游戏已被管理员/群主强制结束！`);
+    ctx.logger.info(`[DYQ] 游戏被强制结束`);
+    currentGame = null;
+}
+
+async function quitGame(ctx: NapCatPluginContext, userId: number, reply: (msg: string) => Promise<void>): Promise<void> {
+    const game = currentGame;
+    if (!game) {
+        await reply(`没有进行中的游戏~`);
+        return;
+    }
+    
+    const playerIndex = game.players.findIndex(p => p.userId === userId);
+    if (playerIndex === -1) {
+        await reply(`你还没有加入游戏~`);
+        return;
+    }
+    
+    const player = game.players[playerIndex];
+    
+    if (game.isActive) {
+        const allPlayerIndex = game.allPlayers.findIndex(p => p.userId === userId);
+        if (allPlayerIndex !== -1) {
+            game.allPlayers[allPlayerIndex].isAlive = false;
+        }
+        game.players.splice(playerIndex, 1);
+        
+        await reply(`${player.nickname} 退出了游戏（金币已扣除）`);
+        
+        if (checkGameEnd()) {
+            await endGame(ctx, reply);
+        }
+    } else {
+        if (!player.isSystem) {
+            const playerData = loadPlayer(userId);
+            if (playerData) {
+                addMoney(playerData, ENTRY_FEE);
+                savePlayer(playerData);
+            }
+        }
+        game.players.splice(playerIndex, 1);
+        await reply(`${player.nickname} 退出了游戏（金币已退还）`);
+        
+        if (game.players.length === 0) {
+            currentGame = null;
+            await reply(`游戏已解散~`);
+        }
+    }
+}
+
+async function processSystemTurn(ctx: NapCatPluginContext, reply: (msg: string) => Promise<void>): Promise<void> {
+    const game = currentGame;
+    if (!game || !game.isActive) return;
+    
+    while (game.currentTurnIndex < game.order.length && 
+           !game.allPlayers[game.order[game.currentTurnIndex]].isAlive) {
+        game.currentTurnIndex++;
+    }
+    
+    if (game.currentTurnIndex >= game.order.length) {
+        await endGame(ctx, reply);
+        return;
+    }
+    
+    const currentPlayer = game.allPlayers[game.order[game.currentTurnIndex]];
+    
+    if (!currentPlayer.isSystem) return;
+    
+    const availableFish = [...game.unusedFish];
+    if (availableFish.length === 0) {
+        await endGame(ctx, reply);
+        return;
+    }
+    
+    const guessedFish = availableFish[Math.floor(Math.random() * availableFish.length)];
+    
+    await reply(`${currentPlayer.nickname}：你有没有【${guessedFish}】？`);
+    
+    await delay(MESSAGE_DELAY_MS);
+    
+    const fishIndex = game.unusedFish.indexOf(guessedFish);
+    if (fishIndex !== -1) game.unusedFish.splice(fishIndex, 1);
+    
+    const isMissing = game.missingFish.includes(guessedFish);
+    
+    if (isMissing) {
+        await reply(`【GO FISH！】
+${currentPlayer.nickname} 出局了！`);
+        eliminatePlayer(game.order[game.currentTurnIndex]);
+    } else {
+        currentPlayer.successCount++;
+        await reply(`【我有！】
+${currentPlayer.nickname} 猜对了！ +1分`);
+    }
+    
+    moveToNextAlivePlayer();
+    
+    if (checkGameEnd()) {
+        await endGame(ctx, reply);
+        return;
+    }
+    
+    await delay(MESSAGE_DELAY_MS);
+    await showTurnInfo(reply);
+    
+    const nextPlayer = game.allPlayers[game.order[game.currentTurnIndex]];
+    if (nextPlayer.isSystem) {
+        await processSystemTurn(ctx, reply);
+    }
+}
+
+// ==================== 指令处理 ====================
+
+export async function handleDyq(
+    ctx: NapCatPluginContext,
+    event: any,
+    sendReply: (msg: string) => Promise<void>
+): Promise<void> {
+    initPlayerStorage(ctx, ctx.dataPath);
+    
+    const userId = event.user_id;
+    const rawMessage = event.raw_message?.trim() || '';
+    const groupId = event.group_id;
+    
+    if (!rawMessage.startsWith('.dyq')) return;
+    
+    const content = rawMessage.slice(5).trim();
+    
+    const reply = async (msg: string): Promise<void> => {
+        await sendReply(msg);
+        await delay(MESSAGE_DELAY_MS);
+    };
+    
+    if (!content) {
+        await reply(`钓鱼趣指令：
+.dyq join - 加入游戏（需${ENTRY_FEE}金币）
+.dyq quit - 退出游戏
+.dyq start - 开始游戏（至少1人，不足5人补充机器人）
+.dyq stop - 停止游戏（仅管理员/群主）
+游戏中输入 .dyq [鱼名] 询问对方有没有这条鱼`);
+        return;
+    }
+    
+    if (content === 'quit') {
+        await quitGame(ctx, userId, reply);
+        return;
+    }
+    
+    if (content === 'stop') {
+        const isAdmin = await isAdminOrOwner(ctx, groupId, userId);
+        if (!isAdmin) {
+            await reply(`只有管理员和群主可以停止游戏~`);
+            return;
+        }
+        await stopGame(ctx, reply);
+        return;
+    }
+    
+    if (content === 'join' || content.startsWith('join ')) {
+        if (!isPlayerExists(userId)) {
+            await reply(`你还没有注册角色！请先使用 .reg 命令注册~`);
+            return;
+        }
+        
+        const registeredNickname = getRegisteredNickname(userId);
+        if (!registeredNickname) {
+            await reply(`获取角色信息失败，请重新注册~`);
+            return;
+        }
+        
+        if (currentGame && currentGame.isActive) {
+            await reply(`游戏中无法加入，请等待当前游戏结束~`);
+            return;
+        }
+        
+        const playerData = loadPlayer(userId);
+        if (!playerData || getMoney(playerData) < ENTRY_FEE) {
+            await reply(`金币不足${ENTRY_FEE}，无法加入游戏~`);
+            return;
+        }
+        
+        if (!currentGame) {
+            await initGame(ctx, groupId, userId);
+            if (!currentGame) {
+                await reply(`创建游戏失败~`);
+                return;
+            }
+            await reply(`${registeredNickname} 加入了游戏！当前人数：${currentGame!.players.length}/10
+输入 .dyq start 开始游戏（至少1人，不足5人将补充机器人）
+注：游戏开始时扣除${ENTRY_FEE}金币`);
+        } else {
+            if (currentGame.players.some(p => p.userId === userId)) {
+                await reply(`你已经加入游戏了~`);
+                return;
+            }
+            currentGame.players.push({ 
+                userId, 
+                nickname: registeredNickname, 
+                successCount: 0, 
+                isAlive: true, 
+                isSystem: false 
+            });
+            await reply(`${registeredNickname} 加入了游戏！当前人数：${currentGame.players.length}/10`);
+        }
+        return;
+    }
+    
+    if (content === 'start') {
+        if (!currentGame) {
+            await reply(`没有进行中的游戏，请先输入 .dyq join 加入游戏~`);
+            return;
+        }
+        if (currentGame.isActive) {
+            await reply(`游戏已经开始！`);
+            return;
+        }
+        if (currentGame.players.length < 1) {
+            await reply(`至少需要1名玩家才能开始~`);
+            return;
+        }
+        await startGameLogic(ctx, reply);
+        if (currentGame && currentGame.order.length > 0) {
+            const firstPlayer = currentGame!.allPlayers[currentGame!.order[0]];
+            if (firstPlayer.isSystem) {
+                await processSystemTurn(ctx, reply);
+            }
+        }
+        return;
+    }
+    
+    if (currentGame && currentGame.isActive) {
+        while (currentGame.currentTurnIndex < currentGame.order.length && 
+               !currentGame.allPlayers[currentGame.order[currentGame.currentTurnIndex]].isAlive) {
+            currentGame.currentTurnIndex++;
+        }
+        
+        if (currentGame.currentTurnIndex >= currentGame.order.length) {
+            await endGame(ctx, reply);
+            return;
+        }
+        
+        const currentPlayer = currentGame.allPlayers[currentGame.order[currentGame.currentTurnIndex]];
+        
+        if (currentPlayer.userId !== userId) {
+            await reply(`还没轮到你哦！当前是 ${currentPlayer.nickname} 的回合~`);
+            return;
+        }
+        
+        const guessedFish = content;
+        
+        if (currentGame.unusedFish.length === 0) {
+            await reply(`所有鱼都已经猜过了！游戏即将结束~`);
+            await endGame(ctx, reply);
+            return;
+        }
+        
+        if (!currentGame.unusedFish.includes(guessedFish)) {
+            await reply(`【${guessedFish}】不在未猜测列表中！请选择其他鱼~
+未猜测的鱼：${currentGame.unusedFish.slice(0, 10).join('、')}${currentGame.unusedFish.length > 10 ? '...' : ''}`);
+            return;
+        }
+        
+        await reply(`${currentPlayer.nickname}：你有没有【${guessedFish}】？`);
+        
+        await delay(MESSAGE_DELAY_MS);
+        
+        const fishIdx = currentGame.unusedFish.indexOf(guessedFish);
+        if (fishIdx !== -1) currentGame.unusedFish.splice(fishIdx, 1);
+        
+        const isMissing = currentGame.missingFish.includes(guessedFish);
+        
+        if (isMissing) {
+            await reply(`【GO FISH！】
+${currentPlayer.nickname} 出局了！`);
+            eliminatePlayer(currentGame.order[currentGame.currentTurnIndex]);
+        } else {
+            currentPlayer.successCount++;
+            await reply(`【我有！】
+${currentPlayer.nickname} 猜对了！ +1分`);
+        }
+        
+        moveToNextAlivePlayer();
+        
+        if (checkGameEnd()) {
+            await endGame(ctx, reply);
+            return;
+        }
+        
+        await delay(MESSAGE_DELAY_MS);
+        await showTurnInfo(reply);
+        
+        const nextPlayer = currentGame.allPlayers[currentGame.order[currentGame.currentTurnIndex]];
+        if (nextPlayer.isSystem) {
+            await processSystemTurn(ctx, reply);
+        }
+        return;
+    }
+    
+    await reply(`钓鱼趣指令：
+.dyq join - 加入游戏（需${ENTRY_FEE}金币）
+.dyq quit - 退出游戏
+.dyq start - 开始游戏（至少1人，不足5人补充机器人）
+.dyq stop - 停止游戏（仅管理员/群主）
+游戏中输入 .dyq [鱼名] 询问对方有没有这条鱼`);
+}

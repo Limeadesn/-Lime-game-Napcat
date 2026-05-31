@@ -1,0 +1,51 @@
+// src/works/index.ts
+
+import type { Work } from './types';
+import { pluginState } from '../core/state';
+
+// ==================== 工作列表（硬编码，仅用于list显示） ====================
+
+export const WORK_LIST = [
+    { id: 1, name: '搬砖', description: '工地搬砖，靠力量吃饭', duration: 6, attribute: 'str', attrRequirement: 3, type: 'I' as const, tier: 1 },
+    { id: 2, name: '试衣模特', description: '展示服装，靠魅力吃饭', duration: 4, attribute: 'cha', attrRequirement: 3, type: 'I' as const, tier: 1 },
+    { id: 3, name: '同城速递', description: '快速配送，靠敏捷吃饭', duration: 4, attribute: 'dex', attrRequirement: 3, type: 'I' as const, tier: 1 },
+    { id: 4, name: '学前班辅导', description: '辅导小朋友，靠智慧吃饭', duration: 8, attribute: 'int', attrRequirement: 3, type: 'I' as const, tier: 1 },
+    { id: 5, name: '钓鱼', description: '悠闲钓鱼，靠运气决定收获', duration: 4, attribute: 'luc', attrRequirement: 0, type: 'II' as const, tier: 1 }
+];
+
+// 获取所有工作（用于list显示）
+export function getAllWorks(): typeof WORK_LIST {
+    return WORK_LIST;
+}
+
+// 根据ID获取工作信息（用于list显示）
+export function getWorkInfoById(id: number): typeof WORK_LIST[0] | undefined {
+    return WORK_LIST.find(w => w.id === id);
+}
+
+// ==================== 动态加载执行模块 ====================
+
+// 预导入所有工作模块
+const WORK_MODULES: Record<number, () => Promise<any>> = {
+    1: () => import('./work_1_brick'),
+    2: () => import('./work_2_model'),
+    3: () => import('./work_3_courier'),
+    4: () => import('./work_4_tutor'),
+    5: () => import('./work_5_fishing')
+};
+
+// 根据ID获取工作执行模块
+export async function getWorkById(id: number): Promise<Work | undefined> {
+    try {
+        const loader = WORK_MODULES[id];
+        if (!loader) {
+            pluginState.logger.error(`[Works] 工作 ${id} 不存在`);
+            return undefined;
+        }
+        const module = await loader();
+        return module.default || module.work;
+    } catch (err) {
+        pluginState.logger.error(`[Works] 加载工作 ${id} 的执行模块失败:`, err);
+        return undefined;
+    }
+}

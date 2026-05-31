@@ -1,0 +1,340 @@
+// src/commands/ticket.ts
+
+import type { NapCatPluginContext } from 'napcat-types/napcat-onebot/network/plugin/types';
+import { initPlayerStorage, isPlayerExists, loadPlayer, savePlayer, getMoney, addMoney } from '../core/player';
+
+// ==================== 呱呱乐配置 ====================
+
+const TICKET_PRICE = 20;
+const WIN_RATE = 0.45;
+
+const GGL_PRIZE_POOL: number[] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 150, 200];
+const GGL_WEIGHTS: number[] = [30, 25, 20, 8, 6, 4, 2, 2, 1, 1, 0.5, 0.5];
+const TOTAL_WEIGHT = GGL_WEIGHTS.reduce((a, b) => a + b, 0);
+
+// ==================== 一击即中配置 ====================
+
+interface OnshotPrize {
+    name: string;
+    amount: number;
+    weight: number;
+}
+
+const ONESHOT_PRIZES: OnshotPrize[] = [
+    { name: '再接再厉', amount: 0,   weight: 18 },
+    { name: '小有收获', amount: 20,  weight: 22 },
+    { name: '时来运转', amount: 50,  weight: 18 },
+    { name: '好运连连', amount: 100, weight: 16 },
+    { name: '鸿运当头', amount: 160, weight: 14 },
+    { name: '天降横财', amount: 250, weight: 12 },
+];
+const ONESHOT_TOTAL_WEIGHT = ONESHOT_PRIZES.reduce((s, p) => s + p.weight, 0);
+const ONESHOT_PRICE = 100;
+
+function roundToTen(value: number): number {
+    return Math.round(value / 10) * 10;
+}
+
+function drawPrizeFromPool(): number {
+    let random = Math.random() * TOTAL_WEIGHT;
+    let accumulated = 0;
+    for (let i = 0; i < GGL_WEIGHTS.length; i++) {
+        accumulated += GGL_WEIGHTS[i];
+        if (random <= accumulated) {
+            return GGL_PRIZE_POOL[i];
+        }
+    }
+    return GGL_PRIZE_POOL[0];
+}
+
+function generateRandomNumber(): number {
+    return Math.floor(Math.random() * 20);
+}
+
+function generateRandomNumberNotEqual(exclude: number): number {
+    let num: number;
+    do {
+        num = generateRandomNumber();
+    } while (num === exclude);
+    return num;
+}
+
+function generateTicketNumbers(winningNumber: number, winningPositions: number[], isWinner: boolean): number[] {
+    const numbers: number[] = new Array(16).fill(0);
+    
+    if (isWinner) {
+        for (const pos of winningPositions) {
+            numbers[pos] = winningNumber;
+        }
+        for (let i = 0; i < 16; i++) {
+            if (!winningPositions.includes(i)) {
+                numbers[i] = generateRandomNumberNotEqual(winningNumber);
+            }
+        }
+    } else {
+        for (let i = 0; i < 16; i++) {
+            numbers[i] = generateRandomNumberNotEqual(winningNumber);
+        }
+    }
+    
+    return numbers;
+}
+
+function generatePrizeAmounts(winningPositions: number[], totalWin: number, isWinner: boolean): number[] {
+    const prizes: number[] = new Array(16).fill(0);
+    
+    if (isWinner && totalWin > 0 && winningPositions.length > 0) {
+        const remainingPositions = [...winningPositions];
+        let remainingAmount = totalWin;
+        
+        for (let i = 0; i < winningPositions.length; i++) {
+            const pos = remainingPositions[i];
+            let allocation: number;
+            
+            if (i === winningPositions.length - 1) {
+                allocation = remainingAmount;
+            } else {
+                const minAlloc = 5;
+                const maxAlloc = remainingAmount - (winningPositions.length - i - 1) * 5;
+                if (maxAlloc <= minAlloc) {
+                    allocation = remainingAmount;
+                } else {
+                    allocation = Math.floor(Math.random() * (maxAlloc - minAlloc + 1)) + minAlloc;
+                }
+                allocation = roundToTen(allocation);
+            }
+            prizes[pos] = allocation;
+            remainingAmount -= allocation;
+        }
+        
+        for (let i = 0; i < 16; i++) {
+            if (!winningPositions.includes(i)) {
+                prizes[i] = drawPrizeFromPool();
+            }
+        }
+    } else {
+        for (let i = 0; i < 16; i++) {
+            prizes[i] = drawPrizeFromPool();
+        }
+    }
+    
+    return prizes;
+}
+
+function formatNumber(num: number): string {
+    return num.toString().padStart(2, '0');
+}
+
+function formatMoney(amount: number): string {
+    return `$${amount}`.padStart(6, ' ');
+}
+
+type TicketHandler = (
+    ctx: NapCatPluginContext,
+    event: any,
+    sendReply: (msg: string) => Promise<void>
+) => Promise<void>;
+
+const TICKET_HANDLERS: Record<string, TicketHandler> = {
+    'ggl': handleGglInternal,
+    'oneshot': handleOneshotInternal,
+};
+
+async function handleGglInternal(
+    ctx: NapCatPluginContext,
+    event: any,
+    sendReply: (msg: string) => Promise<void>
+): Promise<void> {
+    initPlayerStorage(ctx, ctx.dataPath);
+    
+    const userId = event.user_id;
+    const isRegistered = isPlayerExists(userId);
+    
+    if (!isRegistered) {
+        await sendReply(`[错误] 你还没有注册角色！
+请使用 .reg 命令注册后即可购买彩票~`);
+        return;
+    }
+    
+    const player = loadPlayer(userId);
+    if (!player) {
+        await sendReply(`[错误] 获取角色数据失败！`);
+        return;
+    }
+    
+    if (getMoney(player) < TICKET_PRICE) {
+        await sendReply(`[错误] 金币不足！需要${TICKET_PRICE}金币，当前只有${getMoney(player)}金币`);
+        return;
+    }
+    
+    addMoney(player, -TICKET_PRICE);
+    
+    const isWinner = Math.random() < WIN_RATE;
+    
+    let totalWin = 0;
+    let winningPositions: number[] = [];
+    let winningNumber = 0;
+    
+    if (isWinner) {
+        totalWin = drawPrizeFromPool();
+        
+        const numWinningPositions = Math.floor(Math.random() * 4) + 1;
+        const allPositions = Array.from({ length: 16 }, (_, i) => i);
+        
+        for (let i = allPositions.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [allPositions[i], allPositions[j]] = [allPositions[j], allPositions[i]];
+        }
+        winningPositions = allPositions.slice(0, numWinningPositions);
+        winningNumber = generateRandomNumber();
+    } else {
+        totalWin = 0;
+        winningNumber = generateRandomNumber();
+        winningPositions = [];
+    }
+    
+    const ticketNumbers = generateTicketNumbers(winningNumber, winningPositions, isWinner);
+    const prizeAmounts = generatePrizeAmounts(winningPositions, totalWin, isWinner);
+    
+    addMoney(player, totalWin);
+    player.lastActive = Date.now();
+    
+    if (!savePlayer(player)) {
+        await sendReply(`[错误] 保存数据失败！`);
+        return;
+    }
+    
+    const lines: string[] = [];
+    lines.push(`[彩票——刮刮乐]`);
+    lines.push(`中奖号码：${formatNumber(winningNumber)}`);
+    
+    for (let row = 0; row < 4; row++) {
+        const numCells: string[] = [];
+        const prizeCells: string[] = [];
+        for (let col = 0; col < 4; col++) {
+            const idx = row * 4 + col;
+            numCells.push(`${formatNumber(ticketNumbers[idx])}`);
+            prizeCells.push(formatMoney(prizeAmounts[idx]));
+        }
+        lines.push('   ' + numCells.join('   '));
+        lines.push(prizeCells.join(' '));
+        if (row < 3) {
+            lines.push(`----------------------------`);
+        }
+    }
+    
+    if (isWinner && totalWin > 0) {
+        const matchedPositions: number[] = [];
+        for (let i = 0; i < ticketNumbers.length; i++) {
+            if (ticketNumbers[i] === winningNumber && prizeAmounts[i] > 0) {
+                matchedPositions.push(i);
+            }
+        }
+        
+        if (matchedPositions.length > 0) {
+            const posTexts: string[] = [];
+            for (const pos of matchedPositions) {
+                const row = Math.floor(pos / 4) + 1;
+                const col = (pos % 4) + 1;
+                const money = prizeAmounts[pos];
+                posTexts.push(`(${row},${col}) $${money}`);
+            }
+            lines.push(`命中位置：${posTexts.join('  ')}`);
+        } else {
+            lines.push(`很遗憾，没有中奖~`);
+        }
+    } else {
+        lines.push(`很遗憾，没有中奖~`);
+    }
+    
+    lines.push(`总奖金：$${totalWin}`);
+    const netProfit = totalWin - TICKET_PRICE;
+    lines.push(`净收益：${netProfit >= 0 ? '+' : ''}${netProfit}元`);
+    lines.push(`购彩金额：$${TICKET_PRICE}`);
+    lines.push(`当前金币：${getMoney(player)}`);
+    
+    const reply = lines.join('\n');
+    
+    ctx.logger.info(`[Ticket] 用户 ${userId} 购买呱呱乐，中奖 ${totalWin} 元，净收益 ${netProfit} 元`);
+    await sendReply(reply);
+}
+
+async function handleOneshotInternal(
+    ctx: NapCatPluginContext,
+    event: any,
+    sendReply: (msg: string) => Promise<void>
+): Promise<void> {
+    initPlayerStorage(ctx, ctx.dataPath);
+
+    const userId = event.user_id;
+    if (!isPlayerExists(userId)) {
+        await sendReply('[错误] 你还没有注册角色！请使用 .reg 命令注册后即可购买彩票~');
+        return;
+    }
+
+    const player = loadPlayer(userId);
+    if (!player) { await sendReply('[错误] 获取角色数据失败！'); return; }
+    if (getMoney(player) < ONESHOT_PRICE) {
+        await sendReply(`[错误] 金币不足！需要${ONESHOT_PRICE}金币，当前${getMoney(player)}金币`);
+        return;
+    }
+
+    addMoney(player, -ONESHOT_PRICE);
+
+    // 加权抽取奖项
+    let roll = Math.random() * ONESHOT_TOTAL_WEIGHT;
+    let prize: OnshotPrize = ONESHOT_PRIZES[0];
+    for (const p of ONESHOT_PRIZES) {
+        roll -= p.weight;
+        if (roll <= 0) { prize = p; break; }
+    }
+
+    addMoney(player, prize.amount);
+    player.lastActive = Date.now();
+    savePlayer(player);
+
+    const net = prize.amount - ONESHOT_PRICE;
+    const netStr = net >= 0 ? `+${net}` : `${net}`;
+    const lines = [
+        '[一击即中]',
+        '----------------------------------------',
+        `开奖结果：${prize.name}`,
+        `中奖金额：${prize.amount}金币`,
+        `购彩支出：${ONESHOT_PRICE}金币`,
+        `净收益：${netStr}金币`,
+        `当前余额：${getMoney(player)}金币`,
+    ];
+    await sendReply(lines.join('\n'));
+    ctx.logger.info(`[Ticket] 用户 ${userId} 购买一击即中，中奖 ${prize.amount}，净收益 ${net}`);
+}
+
+export async function handleTicket(
+    ctx: NapCatPluginContext,
+    event: any,
+    sendReply: (msg: string) => Promise<void>
+): Promise<void> {
+    const args = (event.args || '').trim();
+    const parts = args.split(/\s+/);
+    const ticketType = parts[0]?.toLowerCase() || '';
+    
+    if (!ticketType) {
+        const lines: string[] = [];
+        lines.push(`[彩票系统]`);
+        lines.push(`----------------------------------------`);
+        lines.push(`可用彩票类型：`);
+        lines.push(`  .ticket ggl - 呱呱乐彩票（20金币/注）`);
+        lines.push(`  .ticket oneshot - 一击即中（100金币/注，返奖率80%）`);
+        lines.push(`----------------------------------------`);
+        await sendReply(lines.join('\n'));
+        return;
+    }
+    
+    const handler = TICKET_HANDLERS[ticketType];
+    if (!handler) {
+        await sendReply(`[错误] 未知的彩票类型：${ticketType}
+可用类型：ggl`);
+        return;
+    }
+    
+    await handler(ctx, event, sendReply);
+}

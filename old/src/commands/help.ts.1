@@ -1,0 +1,126 @@
+// src/commands/help.ts
+
+import type { NapCatPluginContext } from 'napcat-types/napcat-onebot/network/plugin/types';
+
+// 指令详细说明
+const COMMAND_DETAILS: Record<string, { desc: string; subCommands?: Record<string, string> }> = {
+    'help': {
+        desc: '显示帮助信息',
+        subCommands: {
+            '[指令]': '查看指定指令的详细用法'
+        }
+    },
+    'jrrp': {
+        desc: '今日人品运势',
+        subCommands: {
+            '': '随机抽取今日运势，获得金币/心情/健康变化'
+        }
+    },
+    'reg': {
+        desc: '注册游戏角色',
+        subCommands: {
+            'list': '查看可选种类、性别、体态、种族',
+            '<昵称> <种类ID> <性别ID> <体态ID> <种族ID1> [种族ID2]': '创建新角色'
+        }
+    },
+    /*'roll': {
+        desc: '掷骰子',
+        subCommands: {
+            '': '默认 1d100',
+            '[dice]': '指定骰子，如 .roll 20 或 .roll 2d6'
+        }
+    },
+    */
+    'user': {
+        desc: '用户角色管理',
+        subCommands: {
+            'info': '查看角色信息',
+            'upgrade <属性> [点数]': '消耗自由点提升属性，如 .user upgrade STR 2'
+        }
+    },
+    'dyq': {
+        desc: '钓鱼趣游戏',
+        subCommands: {
+            'join [昵称]': '加入游戏',
+            'quit': '退出游戏（未开始退还金币，开始后不退）',
+            'start': '开始游戏',
+            'stop': '停止游戏（仅管理员/群主）',
+            '[鱼名]': '游戏中猜测鱼类'
+        }
+    },
+    'ticket': {
+        desc: '彩票系统',
+        subCommands: {
+            '': '显示可用彩票类型',
+            'ggl': '购买呱呱乐彩票（20金币/注）'
+        }
+    }
+};
+
+// 获取一级菜单（所有指令列表）
+function getMainHelp(): string {
+    const lines: string[] = [];
+    lines.push(`[游戏插件指令列表]`);
+    lines.push(`----------------------------------------`);
+    lines.push(`.help - 显示帮助信息`);
+    lines.push(`.jrrp - 今日人品运势`);
+    lines.push(`.reg - 注册游戏角色`);
+    /*lines.push(`.roll - 掷骰子`);*/
+    lines.push(`.user - 用户角色管理`);
+    lines.push(`.dyq - 钓鱼趣游戏`);
+    lines.push(`.ticket - 彩票系统`);
+    lines.push(`----------------------------------------`);
+    lines.push(`使用 .help <指令> 查看详细用法`);
+    lines.push(`示例: .help reg`);
+    return lines.join('\n');
+}
+
+// 获取指定指令的详细帮助（确保返回 string，不返回 null）
+function getCommandHelp(commandName: string): string {
+    const detail = COMMAND_DETAILS[commandName];
+    
+    const lines: string[] = [];
+    lines.push(`[${commandName}] ${detail?.desc || '未知指令'}`);
+    lines.push(`----------------------------------------`);
+    
+    if (detail?.subCommands && Object.keys(detail.subCommands).length > 0) {
+        for (const [subCmd, desc] of Object.entries(detail.subCommands)) {
+            if (subCmd === '') {
+                lines.push(`.${commandName} ${desc}`);
+            } else {
+                lines.push(`.${commandName} ${subCmd} - ${desc}`);
+            }
+        }
+    } else {
+        lines.push(`.${commandName} - ${detail?.desc || '暂无详细说明'}`);
+    }
+    
+    lines.push(`----------------------------------------`);
+    lines.push(`使用 .help 查看所有指令`);
+    
+    return lines.join('\n');
+}
+
+export async function handleHelp(
+    ctx: NapCatPluginContext,
+    event: any,
+    sendReply: (msg: string) => Promise<void>
+): Promise<void> {
+    const rawMessage = event.raw_message?.trim() || '';
+    const parts = rawMessage.slice(5).trim().split(/\s+/);
+    const cmd = parts[0]?.toLowerCase() || '';
+    
+    // 如果有参数，显示指定指令的详细帮助
+    if (cmd) {
+        // 无论指令是否存在，都返回帮助信息（不存在的会显示"未知指令"）
+        const helpText = getCommandHelp(cmd);
+        await sendReply(helpText);
+        ctx.logger.info(`[Help] 用户查看了 ${cmd} 的详细帮助`);
+        return;
+    }
+    
+    // 无参数，显示一级菜单
+    const helpText = getMainHelp();
+    await sendReply(helpText);
+    ctx.logger.info(`[Help] 用户查看了帮助菜单`);
+}

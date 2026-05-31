@@ -1,0 +1,145 @@
+// src/commands/work.ts - 移除 cancel 部分
+
+import type { NapCatPluginContext } from 'napcat-types/napcat-onebot/network/plugin/types';
+import { initPlayerStorage, isPlayerExists, loadPlayer } from '../core/player';
+import { initScheduleStorage, getUserActiveSchedule, addSchedule, getAllWorkInfos, getWorkInfoById } from '../core/schedule';
+
+const ATTR_NAMES: Record<string, string> = {
+    'str': '力量',
+    'dex': '敏捷',
+    'con': '体质',
+    'int': '智慧',
+    'cha': '魅力',
+    'luc': '运气'
+};
+
+let initialized = false;
+
+export async function handleWork(
+    ctx: NapCatPluginContext,
+    event: any,
+    sendReply: (msg: string) => Promise<void>
+): Promise<void> {
+    if (!initialized) {
+        initPlayerStorage(ctx, ctx.dataPath);
+        initScheduleStorage(ctx, ctx.dataPath);
+        initialized = true;
+    }
+    
+    const userId = event.user_id;
+    const args = (event.args || '').trim();
+    const parts = args.split(/\s+/);
+    const action = parts[0]?.toLowerCase() || '';
+    
+    if (!isPlayerExists(userId)) {
+        await sendReply(`[错误] 你还没有注册角色！请先使用 .reg 命令注册~`);
+        return;
+    }
+    
+    // .work list [页码]
+    if (action === 'list') {
+        const page = parseInt(parts[1], 10) || 1;
+        const allWorks = getAllWorkInfos();
+        const tierWorks = allWorks.filter(w => (w as any).tier === page);
+        
+        if (tierWorks.length === 0) {
+            await sendReply(`[工作列表] 第${page}页暂无工作~`);
+            return;
+        }
+        
+        const lines: string[] = [`[工作列表 - 第${page}页]`];
+        for (const work of tierWorks) {
+            const attrName = ATTR_NAMES[work.attribute] || work.attribute;
+            if (work.type === 'I') {
+                lines.push(`${work.id}. ${work.name} - 时长${work.duration}小时 要求${attrName}≥${work.attrRequirement} (根据${attrName}决定工资)`);
+            } else {
+                lines.push(`${work.id}. ${work.name} - 时长${work.duration}小时 (根据${attrName}决定工资)`);
+            }
+        }
+        
+        // 翻页提示
+        const hasNext = allWorks.some(w => (w as any).tier === page + 1);
+        if (hasNext) {
+            lines.push('----------------------------------------');
+            lines.push(`使用 .work list ${page + 1} 查看下一页`);
+        }
+        
+        await sendReply(lines.join('\n'));
+        return;
+    }
+    
+    // .work select
+    if (action === 'select') {
+        if (parts.length < 2) {
+            await sendReply(`[错误] 格式错误！正确格式: .work select <工作ID>`);
+            return;
+        }
+        
+        const workId = parseInt(parts[1], 10);
+        const workInfo = getWorkInfoById(workId);
+        
+        if (!workInfo) {
+            await sendReply(`[错误] 工作不存在！使用 .work list 查看可用工作`);
+            return;
+        }
+        
+        const existingSchedule = getUserActiveSchedule(userId);
+        if (existingSchedule) {
+            await sendReply(`[错误] 你已有进行中的日程！请等待完成或使用 .schedule cancel 取消`);
+            return;
+        }
+        
+        // 检查心情和健康是否过低
+        const player = loadPlayer(userId);
+        if (!player) {
+            await sendReply(`[错误] 获取玩家数据失败！`);
+            return;
+        }
+        const mood = player.ext.mood ?? 80;
+        const health = player.ext.health ?? 80;
+        if (mood < 20) {
+            await sendReply(`[拒绝] 心情太差了（${mood}），现在完全不想工作...`);
+            return;
+        }
+        if (health < 20) {
+            await sendReply(`[拒绝] 健康太低了（${health}），身体撑不住工作...`);
+            return;
+        }
+
+        // 检查属性要求
+        if (workInfo.type === 'I') {
+            let attrValue = 0;
+            switch (workInfo.attribute) {
+                case 'str': attrValue = player.base.str; break;
+                case 'dex': attrValue = player.base.dex; break;
+                case 'con': attrValue = player.base.con; break;
+                case 'int': attrValue = player.base.int; break;
+                case 'cha': attrValue = player.base.cha; break;
+                case 'luc': attrValue = player.base.luc; break;
+            }
+            
+            if (attrValue < workInfo.attrRequirement) {
+                const attrName = ATTR_NAMES[workInfo.attribute] || workInfo.attribute;
+                await sendReply(`[错误] 属性不足！需要${attrName}≥${workInfo.attrRequirement}，当前${attrName}=${attrValue}`);
+                return;
+            }
+        }
+        
+        if (addSchedule(userId, workId, workInfo.duration, 'work')) {
+            const endTime = new Date(Date.now() + workInfo.duration * 60 * 60 * 1000);
+            await sendReply(`[工作开始] 你开始了“${workInfo.name}”
+预计完成时间：${endTime.toLocaleString()}
+可使用 .user check 查看进度，使用 .schedule cancel 取消`);
+            ctx.logger.info(`[Work] 用户 ${userId} 开始工作: ${workInfo.name}`);
+        } else {
+            await sendReply(`[错误] 无法开始工作，请检查是否已有进行中的日程`);
+        }
+        return;
+    }
+    
+    // 帮助
+    await sendReply(`[工作指令]
+.work list - 查看所有工作
+.work select <工作ID> - 开始工作
+.schedule cancel - 取消当前工作`);
+}
