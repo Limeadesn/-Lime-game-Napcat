@@ -52,11 +52,22 @@ function pickRandom(images: string[]): string | null {
 // ==================== 上传功能 ====================
 
 async function checkAdmin(ctx: NapCatPluginContext, groupId: number, userId: number): Promise<boolean> {
-    if (PluginState.isSuperAdmin(userId)) return true;
+    ctx.logger.info(`[HLS] checkAdmin: userId=${userId} (type=${typeof userId}), groupId=${groupId}, SUPER_ADMIN=${PluginState.SUPER_ADMIN}, isSuperAdmin=${PluginState.isSuperAdmin(userId)}`);
+    if (PluginState.isSuperAdmin(userId)) {
+        ctx.logger.info('[HLS] checkAdmin: 超级管理员，跳过群权限检查');
+        return true;
+    }
     try {
-        const r = await ctx.actions.call('get_group_member_info', { group_id: groupId, user_id: userId }, ctx.adapterName, ctx.pluginManager.config) as any;
-        return r?.role === 'owner' || r?.role === 'admin';
-    } catch { return false; }
+        ctx.logger.info(`[HLS] checkAdmin: 非超级管理员，查询群成员权限... group_id=${groupId} user_id=${userId}`);
+        const r = await ctx.actions.call('get_group_member_info', { group_id: String(groupId), user_id: String(userId) }, ctx.adapterName, ctx.pluginManager.config) as any;
+        ctx.logger.info(`[HLS] checkAdmin: API返回 role=${r?.role}, 完整=${JSON.stringify(r).slice(0, 200)}`);
+        const isAdmin = r?.role === 'owner' || r?.role === 'admin';
+        ctx.logger.info(`[HLS] checkAdmin: 群权限判定=${isAdmin}`);
+        return isAdmin;
+    } catch (e: any) {
+        ctx.logger.error(`[HLS] checkAdmin: get_group_member_info 调用失败: ${e.message || e}`);
+        return false;
+    }
 }
 
 function getNextIndex(userDir: string, qq: string): number {
@@ -116,32 +127,56 @@ function rebuildAllCommon(ctx: NapCatPluginContext): void {
 }
 
 async function uploadHls(ctx: NapCatPluginContext, event: any, sendReply: (m: string) => Promise<void>, args: string): Promise<boolean> {
+    ctx.logger.info(`[HLS] uploadHls 入口: args="${args}", userId=${event.user_id}, groupId=${event.group_id}, message_type=${event.message_type}`);
+    
     const groupId = event.group_id;
-    if (!groupId) { await sendReply('[错误] 仅在群聊中支持上传~'); return false; }
-    if (!await checkAdmin(ctx, groupId, event.user_id)) { await sendReply('[错误] 仅管理员/群主可上传~'); return false; }
+    if (!groupId) {
+        ctx.logger.warn('[HLS] uploadHls: 非群聊，拒绝');
+        await sendReply('[错误] 仅在群聊中支持上传~'); return false;
+    }
+    
+    const adminResult = await checkAdmin(ctx, groupId, event.user_id);
+    ctx.logger.info(`[HLS] uploadHls: checkAdmin 结果=${adminResult}`);
+    if (!adminResult) { await sendReply('[错误] 仅管理员/群主可上传~'); return false; }
 
     const parts = args.split(/\s+/);
     let targetQQ = parts[1] || '';
+    ctx.logger.info(`[HLS] uploadHls: 解析参数 parts=${JSON.stringify(parts)}, targetQQ="${targetQQ}"`);
     // QQ号至少5位数字
-    if (targetQQ && !/^\d{5,}$/.test(targetQQ)) targetQQ = '';
+    if (targetQQ && !/^\d{5,}$/.test(targetQQ)) {
+        ctx.logger.warn(`[HLS] uploadHls: targetQQ 格式不合法 "${targetQQ}"，清空`);
+        targetQQ = '';
+    }
 
     // 必须指定 QQ 号
-    if (!targetQQ) { await sendReply('[错误] 请指定QQ号！\n用法: .hls upload <QQ号> + 图片'); return false; }
+    if (!targetQQ) {
+        ctx.logger.warn('[HLS] uploadHls: 未指定QQ号');
+        await sendReply('[错误] 请指定QQ号！\n用法: .hls upload <QQ号> + 图片'); return false;
+    }
 
     // 附带图片检测
     const msgImages = (event.message || []).filter((s: any) => s.type === 'image');
-    ctx.logger.info('[HLS] upload direct, targetQQ=' + targetQQ + ', images=' + msgImages.length + ', msg=' + JSON.stringify(event.message).slice(0, 300));
-    if (msgImages.length === 0) { await sendReply('[错误] 请附带图片！\n用法: .hls upload <QQ号> + 图片，或回复带图片的消息 + .hls upload'); return false; }
+    ctx.logger.info(`[HLS] uploadHls: 图片检测 targetQQ=${targetQQ}, images=${msgImages.length}, rawMsg=${JSON.stringify(event.message).slice(0, 500)}`);
+    if (msgImages.length === 0) {
+        ctx.logger.warn('[HLS] uploadHls: 消息中无图片');
+        await sendReply('[错误] 请附带图片！\n用法: .hls upload <QQ号> + 图片，或回复带图片的消息 + .hls upload'); return false;
+    }
     try {
         const imgData = msgImages[0].data || {};
+        ctx.logger.info(`[HLS] uploadHls: imgData keys=${Object.keys(imgData).join(',')}, url=${imgData.url?.slice(0, 80)}, file=${imgData.file}`);
         let imgUrl = imgData.url;
         // url 为空时用 file 字段通过 get_image API 获取
         if (!imgUrl && imgData.file) {
-            ctx.logger.info('[HLS] url empty, trying get_image with file=' + imgData.file);
+            ctx.logger.info('[HLS] uploadHls: url 为空，尝试 get_image API, file=' + imgData.file);
             const imgInfo = await ctx.actions.call('get_image', { file: imgData.file }, ctx.adapterName, ctx.pluginManager.config) as any;
+            ctx.logger.info(`[HLS] uploadHls: get_image 返回 ${JSON.stringify(imgInfo).slice(0, 300)}`);
             imgUrl = imgInfo?.url || '';
         }
-        if (!imgUrl) { await sendReply('[错误] 无法获取图片链接，请重试！'); return false; }
+        if (!imgUrl) {
+            ctx.logger.error('[HLS] uploadHls: 无法获取图片链接');
+            await sendReply('[错误] 无法获取图片链接，请重试！'); return false;
+        }
+        ctx.logger.info(`[HLS] uploadHls: 最终 imgUrl=${imgUrl.slice(0, 100)}`);
         const baseDir = getBaseDir(ctx, groupId);
         const userDir = path.join(baseDir, 'users', targetQQ);
         if (!fs.existsSync(userDir)) fs.mkdirSync(userDir, { recursive: true });
@@ -149,12 +184,17 @@ async function uploadHls(ctx: NapCatPluginContext, event: any, sendReply: (m: st
         const ext = getExt(imgUrl);
         const fileName = targetQQ + '-' + idx + ext;
         const dest = path.join(userDir, fileName);
+        ctx.logger.info(`[HLS] uploadHls: 开始下载 → ${dest}`);
         await downloadImage(imgUrl, dest);
+        ctx.logger.info('[HLS] uploadHls: 下载完成，重建 common');
         rebuildAllCommon(ctx);
         await sendReply('[黑历史] 已上传 ' + targetQQ + ' 的第' + idx + '张！');
-        ctx.logger.info('[HLS] 上传 → ' + targetQQ + ' #' + idx);
+        ctx.logger.info('[HLS] uploadHls: 上传成功 → ' + targetQQ + ' #' + idx);
         return true;
-    } catch (e: any) { await sendReply('[错误] ' + e.message); return false; }
+    } catch (e: any) {
+        ctx.logger.error(`[HLS] uploadHls: 异常 ${e.message || e}, stack=${e.stack?.slice(0, 300)}`);
+        await sendReply('[错误] ' + e.message); return false;
+    }
 }
 
 /** 发送图片消息 */
@@ -188,8 +228,11 @@ export async function handleHls(
     const subCmd = parts[0]?.toLowerCase() || '';
     const targetUserId = parts[0] || '';
 
+    ctx.logger.info(`[HLS] handleHls: args="${args}", subCmd="${subCmd}", groupId=${groupId}, userId=${event.user_id}`);
+
     // .hls upload [QQ号]
     if (subCmd === 'upload') {
+        ctx.logger.info('[HLS] handleHls: 路由到 uploadHls');
         await uploadHls(ctx, event, sendReply, args);
         return;
     }
