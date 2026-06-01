@@ -51,13 +51,20 @@ function pickRandom(images: string[]): string | null {
 
 // ==================== 上传功能 ====================
 
-/** 获取目标用户在群内的显示名称（群名片 > QQ昵称 > QQ号） */
+/** 获取目标用户在群内的显示名称（群名片 > QQ昵称 > QQ号；非群成员回退到QQ号） */
 async function getDisplayName(ctx: NapCatPluginContext, groupId: number, userId: string): Promise<string> {
     try {
         const r = await ctx.actions.call('get_group_member_info', { group_id: String(groupId), user_id: userId }, ctx.adapterName, ctx.pluginManager.config) as any;
-        const name = r?.card || r?.nickname || userId;
-        ctx.logger.info(`[HLS] getDisplayName: userId=${userId} → "${name}" (card=${r?.card}, nickname=${r?.nickname})`);
-        return name;
+        const card = r?.card as string | undefined;
+        const nickname = r?.nickname as string | undefined;
+        if (card || nickname) {
+            const name = card || nickname || userId;
+            ctx.logger.info(`[HLS] getDisplayName: userId=${userId} → "${name}" (card=${card}, nickname=${nickname})`);
+            return name;
+        }
+        // API 返回了但 card/nickname 都为空 → 不是群成员
+        ctx.logger.warn(`[HLS] getDisplayName: userId=${userId} 不是群成员，回退到QQ号 (API返回: ${JSON.stringify(r).slice(0, 200)})`);
+        return userId;
     } catch {
         ctx.logger.warn(`[HLS] getDisplayName: API 失败，回退到QQ号 ${userId}`);
         return userId;
