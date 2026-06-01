@@ -51,6 +51,19 @@ function pickRandom(images: string[]): string | null {
 
 // ==================== 上传功能 ====================
 
+/** 获取目标用户在群内的显示名称（群名片 > QQ昵称 > QQ号） */
+async function getDisplayName(ctx: NapCatPluginContext, groupId: number, userId: string): Promise<string> {
+    try {
+        const r = await ctx.actions.call('get_group_member_info', { group_id: String(groupId), user_id: userId }, ctx.adapterName, ctx.pluginManager.config) as any;
+        const name = r?.card || r?.nickname || userId;
+        ctx.logger.info(`[HLS] getDisplayName: userId=${userId} → "${name}" (card=${r?.card}, nickname=${r?.nickname})`);
+        return name;
+    } catch {
+        ctx.logger.warn(`[HLS] getDisplayName: API 失败，回退到QQ号 ${userId}`);
+        return userId;
+    }
+}
+
 async function checkAdmin(ctx: NapCatPluginContext, groupId: number, userId: number): Promise<boolean> {
     ctx.logger.info(`[HLS] checkAdmin: userId=${userId} (type=${typeof userId}), groupId=${groupId}, SUPER_ADMIN=${PluginState.SUPER_ADMIN}, isSuperAdmin=${PluginState.isSuperAdmin(userId)}`);
     if (PluginState.isSuperAdmin(userId)) {
@@ -188,8 +201,9 @@ async function uploadHls(ctx: NapCatPluginContext, event: any, sendReply: (m: st
         await downloadImage(imgUrl, dest);
         ctx.logger.info('[HLS] uploadHls: 下载完成，重建 common');
         rebuildAllCommon(ctx);
-        await sendReply('[黑历史] 已上传 ' + targetQQ + ' 的第' + idx + '张！');
-        ctx.logger.info('[HLS] uploadHls: 上传成功 → ' + targetQQ + ' #' + idx);
+        const displayName = await getDisplayName(ctx, groupId, targetQQ);
+        await sendReply('[黑历史] 已上传 ' + displayName + ' 的第' + idx + '张！');
+        ctx.logger.info(`[HLS] uploadHls: 上传成功 → ${displayName}(${targetQQ}) #${idx}`);
         return true;
     } catch (e: any) {
         ctx.logger.error(`[HLS] uploadHls: 异常 ${e.message || e}, stack=${e.stack?.slice(0, 300)}`);
