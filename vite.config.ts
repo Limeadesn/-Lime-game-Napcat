@@ -45,7 +45,7 @@ function copyDirRecursive(src: string, dest: string) {
 function copyAssetsPlugin() {
     return {
         name: 'copy-assets',
-        writeBundle() {
+        async writeBundle() {
             try {
                 const distDir = resolve(__dirname, 'dist');
 
@@ -117,6 +117,12 @@ function copyAssetsPlugin() {
                 }
 
                 console.log('[copy-assets] (*\'v\'*) 资源复制完成！');
+
+                // 自动 Git 提交
+                try {
+                    execSync('git add -A && git commit -m "build: 自动提交"', { cwd: __dirname, stdio: 'pipe' });
+                    console.log('[copy-assets] (o\'v\'o) Git 自动提交完成');
+                } catch { /* 无变更则跳过 */ }
             } catch (error) {
                 console.error('[copy-assets] (;_;) 资源复制失败:', error);
             }
